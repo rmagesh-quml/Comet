@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx jest:*)",
+      "Bash(npm install:*)",
+      "Bash(node -e \"require\\(''''spotify-web-api-node''''\\)\")",
+      "Bash(node -e \"const pkg = require\\(''./node_modules/gtfs-realtime-bindings/package.json''\\); console.log\\(pkg.version, pkg.main || pkg.exports\\)\")",
+      "Bash(node -e \"const pkg = require\\(''./node_modules/node-fetch/package.json''\\); console.log\\(''node-fetch'', pkg.version, pkg.type\\)\")",
+      "Bash(node -e \"const b = require\\(''gtfs-realtime-bindings''\\); console.log\\(Object.keys\\(b\\)\\)\")",
+      "Bash(node -e \"const b = require\\(''gtfs-realtime-bindings''\\); console.log\\(Object.keys\\(b.transit_realtime\\)\\)\")",
+      "Bash(node -e \"const b = require\\(''gtfs-realtime-bindings''\\); const m = b.transit_realtime.FeedMessage; console.log\\(typeof m.decode, typeof m.verify\\)\")",
+      "Bash(npm test:*)"
+    ]
+  }
+}

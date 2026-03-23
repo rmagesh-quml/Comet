@@ -1,0 +1,7 @@
+node_modules/
+.env
+.env.local
+.linq-signing-secret
+*.log
+coverage/
+.DS_Store
