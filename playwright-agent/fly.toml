@@ -1,0 +1,43 @@
+# fly.toml — comet-playwright-agent
+# Deploy: fly deploy --app comet-playwright
+
+app            = 'comet-playwright'
+primary_region = 'iad'
+
+[build]
+  # Builds from the Dockerfile in this directory
+
+[env]
+  PORT       = '3001'
+  NODE_ENV   = 'production'
+
+# ── HTTP service ──────────────────────────────────────────────────────────────
+[http_service]
+  internal_port        = 3001
+  force_https          = true
+  auto_stop_machines   = 'stop'   # scale to zero when idle
+  auto_start_machines  = true     # wake on first request
+  min_machines_running = 0        # allow full scale-to-zero
+
+  # Machines stop after ~5 minutes of no incoming requests (Fly.io default).
+  # Adjust via: fly scale --min-machines 0 --max-machines 3
+
+  [http_service.concurrency]
+    type       = 'requests'
+    hard_limit = 10   # shed load above this
+    soft_limit = 5
+
+# ── Machine size ──────────────────────────────────────────────────────────────
+# 1 shared CPU + 1 GB RAM — minimum for stable headless Chromium
+[[vm]]
+  cpu_kind = 'shared'
+  cpus     = 1
+  memory   = '1gb'
+
+# ── Health checks ─────────────────────────────────────────────────────────────
+[[http_service.checks]]
+  grace_period = '20s'
+  interval     = '30s'
+  method       = 'GET'
+  path         = '/health'
+  timeout      = '10s'

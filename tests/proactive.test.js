@@ -320,7 +320,8 @@ describe('proactive', () => {
 
       expect(claude.generateUserMessage).toHaveBeenCalledWith(
         expect.stringContaining('Algorithms'),
-        expect.any(Array)
+        expect.any(Array),
+        400, 'proactive'
       );
     });
   });
@@ -570,7 +571,7 @@ describe('proactive', () => {
 
       expect(claude.classify).toHaveBeenCalledWith(
         expect.stringContaining('Plan proactive messages'),
-        500
+        500, 'classification'
       );
     });
 

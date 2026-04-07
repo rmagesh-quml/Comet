@@ -84,7 +84,8 @@ async function eventReminder(userId, event) {
     `You are a helpful assistant texting a college student. Send a casual one-sentence reminder about an upcoming event. No emojis unless natural.
 Event: ${event.title}
 Starts in: ~${minutesOut} minutes${event.location ? `\nLocation: ${event.location}` : ''}`,
-    [{ role: 'user', content: `remind me about ${event.title}` }]
+    [{ role: 'user', content: `remind me about ${event.title}` }],
+    400, 'proactive'
   );
 
   await sendTypingIndicator(user.phone_number, userId);
@@ -134,7 +135,8 @@ async function canvasAlert(userId) {
     `You are a helpful assistant texting a college student. Be casual and brief, max 2 sentences.
 Canvas update: ${JSON.stringify(context)}
 Remind them about upcoming/missing work. Suggest a free block for studying if available.`,
-    [{ role: 'user', content: "what do i have due?" }]
+    [{ role: 'user', content: "what do i have due?" }],
+    400, 'proactive'
   );
 
   await sendMessage(user.phone_number, message, userId);
@@ -156,7 +158,8 @@ async function importantEmailAlert(userId, email, fullBody) {
 From: ${email.from}
 Subject: ${email.subject}
 Preview: ${(fullBody || '').slice(0, 200)}`,
-    [{ role: 'user', content: `email from ${email.from}` }]
+    [{ role: 'user', content: `email from ${email.from}` }],
+    400, 'proactive'
   );
 
   await sendMessage(user.phone_number, message, userId);
@@ -204,7 +207,8 @@ async function healthNudge(userId) {
     `You are a caring friend. Send a gentle, empathetic message to a college student who seems tired/worn down.
 Never preachy. 1-2 sentences. Warm and human, not a wellness lecture.
 Context: readiness score ${readiness ?? 'low'}/100, ${todayEventCount} events today${consecutiveLow >= 3 ? ', low energy 3 days in a row' : ''}.`,
-    [{ role: 'user', content: 'how am i doing?' }]
+    [{ role: 'user', content: 'how am i doing?' }],
+    400, 'proactive'
   );
 
   await sendMessage(user.phone_number, message, userId);
@@ -260,7 +264,8 @@ async function nightlyDigest(userId) {
     `You are a friendly assistant sending a warm nightly check-in to a college student.
 Preview tomorrow briefly and end warmly. Human tone, not a bulleted list. 2-3 short messages worth of content.
 Context: ${JSON.stringify(context)}`,
-    [{ role: 'user', content: "what's tomorrow looking like?" }]
+    [{ role: 'user', content: "what's tomorrow looking like?" }],
+    400, 'proactive'
   );
 
   // Split on double newlines for multi-message delivery
@@ -299,7 +304,8 @@ async function processPendingTriggers() {
           `You are a helpful assistant texting a college student. Be casual and brief.
 Scheduled message: ${msg.purpose}
 Context: ${JSON.stringify(context)}`,
-          [{ role: 'user', content: msg.purpose }]
+          [{ role: 'user', content: msg.purpose }],
+          400, 'proactive'
         );
 
         await sendMessage(msg.phone_number, text, msg.user_id);
@@ -418,7 +424,7 @@ async function nightlyPlan(userId) {
 
     let triggers = [];
     try {
-      const raw = await classify(prompt, 500);
+      const raw = await classify(prompt, 500, 'classification');
       const parsed = JSON.parse(raw.trim());
       if (Array.isArray(parsed)) triggers = parsed;
     } catch {

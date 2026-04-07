@@ -83,6 +83,50 @@ app.get('/health', (req, res) => {
   });
 });
 
+// ─── Agent registry status ────────────────────────────────────────────────────
+// Probes registered agent /health endpoints and returns a unified status view.
+// Configure agents by setting PLAYWRIGHT_AGENT_URL (and optionally more) in .env
+
+const REGISTERED_AGENTS = [
+  { name: 'playwright-agent', urlEnv: 'PLAYWRIGHT_AGENT_URL' },
+];
+
+app.get('/agents/status', async (req, res) => {
+  const probes = REGISTERED_AGENTS
+    .map(agent => ({ ...agent, url: process.env[agent.urlEnv] }))
+    .filter(agent => agent.url);
+
+  const results = await Promise.all(
+    probes.map(async agent => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      try {
+        const response = await fetch(`${agent.url}/health`, {
+          signal: controller.signal,
+        });
+        const data = await response.json();
+        return { name: agent.name, url: agent.url, online: true, ...data };
+      } catch (err) {
+        return {
+          name: agent.name,
+          url: agent.url,
+          online: false,
+          error: err.name === 'AbortError' ? 'timeout' : err.message,
+        };
+      } finally {
+        clearTimeout(timer);
+      }
+    })
+  );
+
+  res.json({
+    agents: results,
+    total: results.length,
+    online: results.filter(a => a.online).length,
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // ─── Conditional Linq webhook verification middleware ─────────────────────────
 
 function conditionalLinqVerify(req, res, next) {

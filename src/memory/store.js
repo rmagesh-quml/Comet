@@ -1,96 +1,65 @@
 'use strict';
 
-const { QdrantClient } = require('@qdrant/js-client-rest');
-const { randomUUID } = require('crypto');
-const { getEmbedding } = require('./embeddings');
+const { MemoryClient } = require('mem0ai');
 
-const COLLECTION = 'memories';
-const VECTOR_SIZE = 1536;
-const SCORE_THRESHOLD = 0.65;
+// ─── Singleton client ─────────────────────────────────────────────────────────
 
-// ─── Client ───────────────────────────────────────────────────────────────────
+let _client = null;
 
-let client = null;
+function getClient() {
+  if (!_client) {
+    _client = new MemoryClient({ apiKey: process.env.MEM0_API_KEY });
+  }
+  return _client;
+}
+
+// ─── Init (called on startup — kept for API compatibility with index.js) ──────
+// Performs a lightweight connectivity check against the Mem0 cloud API.
 
 async function initQdrant() {
-  client = new QdrantClient({
-    url: process.env.QDRANT_URL || 'http://localhost:6333',
-    apiKey: process.env.QDRANT_API_KEY,
-  });
-
   try {
-    const { collections } = await client.getCollections();
-    const exists = collections.some(c => c.name === COLLECTION);
-
-    if (!exists) {
-      await client.createCollection(COLLECTION, {
-        vectors: { size: VECTOR_SIZE, distance: 'Cosine' },
-      });
-      console.log(`Qdrant: created collection '${COLLECTION}'`);
-    } else {
-      console.log(`Qdrant: collection '${COLLECTION}' ready`);
-    }
+    await getClient().getAll({ user_id: '__healthcheck__', limit: 1 });
+    console.log('Mem0: cloud connection ready');
   } catch (err) {
-    console.error('Qdrant init error:', err.message || err);
+    // Surface the error but don't crash — memory degrades gracefully
+    console.warn('Mem0: startup health check failed (non-fatal):', err.message || err);
   }
-
-  return client;
 }
 
 // ─── Store ────────────────────────────────────────────────────────────────────
+// Mem0's add() expects an array of {role, content} messages and extracts
+// memories automatically using its own LLM pipeline.
 
 async function storeMemory(userId, text, metadata = {}) {
-  if (!client) return;
-
-  const { type = 'preference', importance = 5, source = 'unknown' } = metadata;
-
-  const vector = await getEmbedding(text);
-  const id = randomUUID();
-  const now = new Date();
-
-  await client.upsert(COLLECTION, {
-    wait: true,
-    points: [
-      {
-        id,
-        vector,
-        payload: {
-          userId,
-          text,
-          type,
-          importance,
-          source,
-          timestamp: now.toISOString(),
-          ts: now.getTime(), // numeric unix ms for range filtering
-        },
-      },
-    ],
-  });
+  try {
+    await getClient().add(
+      [{ role: 'user', content: text }],
+      { user_id: String(userId), metadata }
+    );
+  } catch (err) {
+    console.error(`storeMemory error for user ${userId}:`, err.message || err);
+  }
 }
 
 // ─── Search ───────────────────────────────────────────────────────────────────
+// Mem0 v1 search returns a plain array:
+//   [{ id, memory, user_id, metadata, score, ... }]
 
 async function searchMemories(userId, query, limit = 5) {
-  if (!client) return [];
-
   try {
-    const vector = await getEmbedding(query);
-
-    const results = await client.search(COLLECTION, {
-      vector,
+    const raw = await getClient().search(query, {
+      user_id: String(userId),
       limit,
-      score_threshold: SCORE_THRESHOLD,
-      filter: {
-        must: [{ key: 'userId', match: { value: userId } }],
-      },
-      with_payload: true,
     });
 
+    // Normalise: v1 → array directly, v2 → { results: [] }
+    const results = Array.isArray(raw) ? raw : (raw?.results ?? []);
+
     return results.map(r => ({
-      text: r.payload.text,
-      type: r.payload.type,
-      importance: r.payload.importance,
-      score: r.score,
+      text:       r.memory,
+      type:       r.metadata?.type       ?? 'preference',
+      importance: r.metadata?.importance ?? 5,
+      score:      r.score                ?? 1,
     }));
   } catch (err) {
     console.error(`searchMemories error for user ${userId}:`, err.message || err);
@@ -99,36 +68,16 @@ async function searchMemories(userId, query, limit = 5) {
 }
 
 // ─── Cleanup ──────────────────────────────────────────────────────────────────
+// deleteOldMemories: Mem0 manages its own memory lifecycle in the cloud —
+// no manual TTL pruning needed.
 
-async function deleteOldMemories(userId) {
-  if (!client) return;
-
-  const ninetyDaysAgo = Date.now() - 90 * 24 * 60 * 60 * 1000;
-
-  try {
-    await client.delete(COLLECTION, {
-      filter: {
-        must: [
-          { key: 'userId', match: { value: userId } },
-          { key: 'importance', range: { lt: 5 } },
-          { key: 'ts', range: { lt: ninetyDaysAgo } },
-        ],
-      },
-    });
-  } catch (err) {
-    console.error(`deleteOldMemories error for user ${userId}:`, err.message || err);
-  }
+async function deleteOldMemories(_userId) {
+  // no-op: Mem0 cloud handles memory consolidation and expiry automatically
 }
 
 async function deleteUserMemories(userId) {
-  if (!client) return;
-
   try {
-    await client.delete(COLLECTION, {
-      filter: {
-        must: [{ key: 'userId', match: { value: userId } }],
-      },
-    });
+    await getClient().deleteAll({ user_id: String(userId) });
   } catch (err) {
     console.error(`deleteUserMemories error for user ${userId}:`, err.message || err);
   }
