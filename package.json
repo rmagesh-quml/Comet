@@ -14,7 +14,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.37.0",
+    "@anthropic-ai/sdk": "^0.86.1",
     "@azure/msal-node": "^3.8.10",
     "@microsoft/microsoft-graph-client": "^3.0.7",
     "agentops": "^0.1.0",
