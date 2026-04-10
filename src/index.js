@@ -8,8 +8,11 @@ const db = require('./db');
 const { getResponse } = require('./brain');
 const {
   isLinqAvailable,
+  isTelegramAvailable,
   verifyLinqWebhook,
+  verifyTelegramWebhook,
   registerLinqWebhook,
+  registerTelegramWebhook,
   sendMessage,
   detectAndUpdateMessagingService,
 } = require('./sms');
@@ -66,6 +69,7 @@ app.use(express.urlencoded({ extended: true, verify: captureRawBody })); // need
 
 // Apply rate limiters
 app.use('/webhook', webhookLimiter);
+app.use('/telegram-webhook', webhookLimiter);
 app.use('/graph-webhook', strictLimiter);
 app.use('/gmail-webhook', strictLimiter);
 app.use('/discord-digest', strictLimiter);
@@ -79,7 +83,11 @@ app.get('/health', (req, res) => {
     status: 'ok',
     uptime: process.uptime(),
     timestamp: new Date(),
-    provider: isLinqAvailable() ? 'linq' : 'twilio',
+    providers: [
+      isLinqAvailable() && 'linq',
+      isTelegramAvailable() && 'telegram',
+      'twilio',
+    ].filter(Boolean),
   });
 });
 
@@ -263,6 +271,70 @@ app.post('/gmail-webhook', (req, res) => {
 
 app.post('/discord-digest', handleDiscordDigest);
 
+// ─── Telegram webhook ─────────────────────────────────────────────────────────
+// Telegram POSTs a JSON Update object to this URL.
+// Verified via X-Telegram-Bot-Api-Secret-Token if TELEGRAM_WEBHOOK_SECRET is set.
+
+app.post('/telegram-webhook', verifyTelegramWebhook, (req, res) => {
+  res.sendStatus(200); // acknowledge immediately
+  setImmediate(async () => {
+    try {
+      await handleTelegramUpdate(req.body);
+    } catch (err) {
+      console.error('Telegram webhook error:', err.message || err);
+    }
+  });
+});
+
+async function handleTelegramUpdate(update) {
+  const message = update.message || update.edited_message;
+  if (!message || !message.text) return;
+
+  const chatId = String(message.chat.id);
+  const text = message.text.trim();
+  const firstName = message.from?.first_name;
+
+  if (!text) return;
+
+  const user = await db.getOrCreateUserByTelegram(chatId, firstName);
+  if (!user) return;
+
+  // /start — treat as a fresh greeting; re-run step 0 if not yet onboarded
+  if (text === '/start') {
+    if (user.onboarding_complete) {
+      await sendMessage(null, "you're already all set! text me anything — i'm here", user.id);
+    } else {
+      // Reset to step 0 so they get the intro messages
+      await db.updateUser(user.id, { onboarding_step: 0 });
+      const freshUser = { ...user, onboarding_step: 0 };
+      await handleOnboardingMessage(freshUser, text);
+    }
+    return;
+  }
+
+  // Deletion confirmation flow
+  if (user.deletion_code && new Date(user.deletion_code_expires_at) > new Date()) {
+    const deleted = await confirmDeletion(user.id, text);
+    if (deleted) {
+      await sendMessage(null, "your account and all data have been deleted. take care 👋", null);
+      // Send directly since userId is now gone
+      const { telegramSendMessage } = require('./sms');
+      await telegramSendMessage(chatId, "your account and all data have been deleted. take care 👋")
+        .catch(() => {});
+    } else {
+      await sendMessage(null, "that code didn't match — text 'delete my account' again to get a new one", user.id);
+    }
+    return;
+  }
+
+  if (!user.onboarding_complete) {
+    await handleOnboardingMessage(user, text);
+  } else {
+    const reply = await getResponse(user.id, text);
+    if (reply) await sendMessage(null, reply, user.id);
+  }
+}
+
 // ─── Microsoft OAuth callback ─────────────────────────────────────────────────
 
 app.get('/auth/microsoft', async (req, res) => {
@@ -357,12 +429,23 @@ async function startup() {
       .catch(e => console.error('Linq webhook registration failed:', e.message || e));
   }
 
+  if (isTelegramAvailable()) {
+    const tgWebhookUrl = process.env.TELEGRAM_WEBHOOK_URL ||
+      `${process.env.PUBLIC_URL || ''}/telegram-webhook`;
+    await registerTelegramWebhook(tgWebhookUrl)
+      .catch(e => console.error('Telegram webhook registration failed:', e.message || e));
+  }
+
   scheduleAllJobs();
   console.log('scheduler running');
 
   app.listen(PORT, () => {
-    const provider = isLinqAvailable() ? 'linq' : 'twilio';
-    console.log(`agent running on port ${PORT} (provider: ${provider})`);
+    const providers = [
+      isLinqAvailable() && 'linq',
+      isTelegramAvailable() && 'telegram',
+      'twilio',
+    ].filter(Boolean).join(', ');
+    console.log(`agent running on port ${PORT} (providers: ${providers})`);
   });
 }
 

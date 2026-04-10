@@ -170,6 +170,8 @@ async function setup() {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS early_brief_sent_date DATE;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS deletion_code VARCHAR;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS deletion_code_expires_at TIMESTAMP;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_chat_id VARCHAR UNIQUE;
+      ALTER TABLE users ALTER COLUMN phone_number DROP NOT NULL;
     `);
   } finally {
     client.release();
@@ -203,6 +205,42 @@ async function getUserByPhone(phoneNumber) {
   const result = await pool.query(
     'SELECT * FROM users WHERE phone_number = $1',
     [phoneNumber]
+  );
+  return result.rows[0] || null;
+}
+
+async function getOrCreateUserByTelegram(chatId, firstName) {
+  const chatIdStr = String(chatId);
+
+  // Try existing user
+  const existing = await pool.query(
+    'SELECT * FROM users WHERE telegram_chat_id = $1',
+    [chatIdStr]
+  );
+  if (existing.rows.length > 0) return existing.rows[0];
+
+  // Create Telegram-only user (phone_number is NULL — allowed after migration)
+  const result = await pool.query(
+    `INSERT INTO users (telegram_chat_id, name)
+     VALUES ($1, $2)
+     ON CONFLICT (telegram_chat_id) DO NOTHING
+     RETURNING *`,
+    [chatIdStr, firstName || null]
+  );
+  if (result.rows.length > 0) return result.rows[0];
+
+  // Race condition: another request inserted first
+  const retry = await pool.query(
+    'SELECT * FROM users WHERE telegram_chat_id = $1',
+    [chatIdStr]
+  );
+  return retry.rows[0];
+}
+
+async function getUserByTelegramChatId(chatId) {
+  const result = await pool.query(
+    'SELECT * FROM users WHERE telegram_chat_id = $1',
+    [String(chatId)]
   );
   return result.rows[0] || null;
 }
@@ -750,8 +788,10 @@ module.exports = {
   setup,
   // Users
   getOrCreateUser,
+  getOrCreateUserByTelegram,
   getUserById,
   getUserByPhone,
+  getUserByTelegramChatId,
   getUserByGoogleEmail,
   updateUser,
   getAllActiveUsers,

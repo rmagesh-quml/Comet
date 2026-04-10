@@ -181,6 +181,95 @@ function verifyLinqWebhook(req, res, next) {
   next();
 }
 
+// ─── Telegram implementation ─────────────────────────────────────────────────
+
+const TELEGRAM_API = 'https://api.telegram.org';
+
+function isTelegramAvailable() {
+  return !!(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_TOKEN.trim());
+}
+
+function telegramApiUrl(method) {
+  return `${TELEGRAM_API}/bot${process.env.TELEGRAM_BOT_TOKEN}/${method}`;
+}
+
+// Telegram has a 4096-char message limit. Split at the last newline before the limit.
+function splitForTelegram(text, limit = 4096) {
+  if (text.length <= limit) return [text];
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > limit) {
+    const slice = remaining.slice(0, limit);
+    const lastNewline = slice.lastIndexOf('\n');
+    const cutAt = lastNewline > limit * 0.5 ? lastNewline : limit;
+    chunks.push(remaining.slice(0, cutAt).trim());
+    remaining = remaining.slice(cutAt).trim();
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
+}
+
+async function telegramSendMessage(chatId, text) {
+  const chunks = splitForTelegram(text);
+  for (const chunk of chunks) {
+    const res = await fetch(telegramApiUrl('sendMessage'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: chunk,
+        // parse_mode omitted intentionally — plain text is safest default.
+        // Markdown in user-facing messages can break on unescaped characters.
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`Telegram sendMessage error ${res.status}: ${body}`);
+    }
+  }
+}
+
+async function telegramSendTypingIndicator(chatId) {
+  try {
+    await fetch(telegramApiUrl('sendChatAction'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, action: 'typing' }),
+    });
+  } catch (_) {
+    // fire and forget
+  }
+}
+
+// Register (or re-register) the bot webhook with Telegram.
+// Called once at startup when TELEGRAM_BOT_TOKEN is configured.
+async function registerTelegramWebhook(webhookUrl) {
+  const secret = process.env.TELEGRAM_WEBHOOK_SECRET;
+  const body = { url: webhookUrl, allowed_updates: ['message'] };
+  if (secret) body.secret_token = secret;
+
+  const res = await fetch(telegramApiUrl('setWebhook'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(`Telegram webhook registration failed: ${data.description}`);
+  console.log('Telegram webhook registered:', webhookUrl);
+}
+
+// Verify the X-Telegram-Bot-Api-Secret-Token header (optional but recommended).
+function verifyTelegramWebhook(req, res, next) {
+  const secret = process.env.TELEGRAM_WEBHOOK_SECRET;
+  if (!secret) return next(); // no secret configured → skip verification
+
+  const header = req.headers['x-telegram-bot-api-secret-token'];
+  if (!header || header !== secret) {
+    return res.status(401).send('Invalid Telegram webhook secret');
+  }
+  next();
+}
+
 // ─── Twilio implementation ────────────────────────────────────────────────────
 
 async function twilioSendMessage(toNumber, text) {
@@ -219,10 +308,26 @@ async function sendMessage(toNumber, text, userId) {
     return { success: false };
   }
 
-  let messageId = null;
-  let provider = 'twilio';
-
   try {
+    // ── Telegram routing ─────────────────────────────────────────────────────
+    // Telegram-only users have no phone number. When toNumber is falsy and
+    // we have a userId, look up their telegram_chat_id and route there.
+    if (!toNumber && userId && isTelegramAvailable()) {
+      const user = await db.getUserById(userId);
+      if (user?.telegram_chat_id) {
+        await telegramSendMessage(user.telegram_chat_id, text);
+        await db.logSentMessage(userId, 'outbound', text, 'sent');
+        await incrementCount(userId);
+        return { success: true, provider: 'telegram' };
+      }
+      console.error(`sendMessage: no toNumber and no telegram_chat_id for userId=${userId}`);
+      return { success: false };
+    }
+
+    // ── SMS routing: Linq → Twilio ────────────────────────────────────────────
+    let messageId = null;
+    let provider = 'twilio';
+
     if (isLinqAvailable() && await isIMessageUser(userId)) {
       try {
         const result = await linqSendMessage(toNumber, text);
@@ -252,7 +357,7 @@ async function sendMessage(toNumber, text, userId) {
 
     await db.logSentMessage(userId, 'outbound', text, 'sent');
     await incrementCount(userId);
-    return { success: true, messageId };
+    return { success: true, messageId, provider };
   } catch (err) {
     console.error('sendMessage unexpected error:', err.message || err);
     return { success: false };
@@ -262,11 +367,22 @@ async function sendMessage(toNumber, text, userId) {
 async function sendMultiple(toNumber, texts, userId, delayMs = 1500) {
   const results = [];
 
+  // Telegram: send all messages, pause briefly between to preserve order
+  if (!toNumber && userId && isTelegramAvailable()) {
+    const user = await db.getUserById(userId);
+    if (user?.telegram_chat_id) {
+      for (let i = 0; i < texts.length; i++) {
+        if (i > 0) await new Promise(r => setTimeout(r, 400));
+        results.push(await sendMessage(null, texts[i], userId));
+      }
+      return results;
+    }
+  }
+
+  // SMS: Linq → Twilio
   if (isLinqAvailable() && await isIMessageUser(userId)) {
     for (let i = 0; i < texts.length; i++) {
-      if (i > 0) {
-        await new Promise(resolve => setTimeout(resolve, delayMs));
-      }
+      if (i > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
       try {
         const result = await linqSendMessage(toNumber, texts[i]);
         results.push({ success: true, messageId: result?.id || null });
@@ -289,10 +405,17 @@ async function sendMultiple(toNumber, texts, userId, delayMs = 1500) {
 }
 
 async function sendTypingIndicator(toNumber, userId) {
+  if (!toNumber && userId && isTelegramAvailable()) {
+    // Telegram-only user — look up chat_id and send typing action
+    db.getUserById(userId).then(user => {
+      if (user?.telegram_chat_id) telegramSendTypingIndicator(user.telegram_chat_id);
+    }).catch(() => {});
+    return;
+  }
   if (isLinqAvailable() && await isIMessageUser(userId)) {
     linqSendTypingIndicator(toNumber); // fire and forget
   }
-  // else no-op — don't log, just return
+  // else no-op
 }
 
 async function sendReaction(toNumber, messageId, emoji, userId) {
@@ -311,6 +434,7 @@ module.exports = {
   // Provider detection
   isLinqAvailable,
   isIMessageUser,
+  isTelegramAvailable,
   // Linq internals (exported for testing)
   linqSendMessage,
   linqSendTypingIndicator,
@@ -322,6 +446,11 @@ module.exports = {
   twilioSendMessage,
   twilioSendMultiple,
   getTwilioClient,
+  // Telegram internals
+  telegramSendMessage,
+  telegramSendTypingIndicator,
+  registerTelegramWebhook,
+  verifyTelegramWebhook,
   // Unified public API
   sendMessage,
   sendMultiple,
