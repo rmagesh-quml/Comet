@@ -19,14 +19,14 @@ RUN apk add --no-cache \
     ca-certificates \
     ttf-freefont \
     font-noto-emoji \
-    # Needed for headless stability in containers
     udev \
-    # Runtime deps sometimes required
-    libstdc++
+    libstdc++ \
+    && chromium-browser --version
 
 # Tell Playwright to skip its own download and use the system browser
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser
+ENV CHROMIUM_PATH=/usr/bin/chromium-browser
 
 WORKDIR /app
 
