@@ -198,6 +198,12 @@ async function compactHistory(userId) {
 
   const summary = await classify(summaryPrompt);
 
+  // Guard: don't delete messages if summarization failed or returned garbage
+  if (!summary || summary.trim().length < 15) {
+    console.warn(`[compactHistory] skipping compaction for user ${userId} — summary too short`);
+    return;
+  }
+
   const ids = oldest.map(m => m.id);
   await db.deleteMessages(userId, ids);
   await db.saveMessage(

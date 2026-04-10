@@ -258,27 +258,6 @@ async function sendMorningBrief(userId) {
   await db.logMorningBriefSent(userId).catch(() => {});
 }
 
-async function runNightlyPlanning(userId) {
-  const user = await db.getUserById(userId);
-  if (!user) return;
-  await sendMessage(
-    user.phone_number,
-    "hey, how did today go? anything you want to plan for tomorrow?",
-    userId
-  );
-}
-
-async function processPendingScheduledMessages() {
-  try {
-    const pending = await db.getPendingScheduledMessages();
-    for (const msg of pending) {
-      await sendMessage(msg.phone_number, msg.purpose, msg.user_id);
-      await db.markMessageSent(msg.id);
-    }
-  } catch (err) {
-    console.error('Error processing scheduled messages:', err.message || err);
-  }
-}
 
 // ─── Per-user timezone-aware cron jobs ───────────────────────────────────────
 
@@ -411,19 +390,6 @@ function scheduleAllJobs() {
     }
   });
 
-  // Nightly planning at 10:30pm
-  cron.schedule('30 22 * * *', async () => {
-    try {
-      const users = await db.getAllActiveUsers();
-      for (const user of users) {
-        if (await isInClass(user.id)) continue;
-        await runNightlyPlanning(user.id);
-      }
-    } catch (err) {
-      console.error('Nightly planning error:', err.message || err);
-    }
-  });
-
   // Every 5 minutes: process AI-planned triggers + check for upcoming events
   cron.schedule('*/5 * * * *', async () => {
     try {
@@ -436,8 +402,6 @@ function scheduleAllJobs() {
     } catch (err) {
       console.error('checkUpcomingEvents error:', err.message || err);
     }
-    // Also process legacy morning_brief scheduled messages
-    await processPendingScheduledMessages();
   });
 
   // Renew Microsoft Graph webhook subscriptions daily at 3am
@@ -449,12 +413,17 @@ function scheduleAllJobs() {
     }
   });
 
-  // Fetch BT real-time predictions every 30 seconds
+  // Fetch BT real-time predictions every 30 seconds (overlap guard prevents pile-up)
+  let _btFetchRunning = false;
   cron.schedule('*/30 * * * * *', async () => {
+    if (_btFetchRunning) return;
+    _btFetchRunning = true;
     try {
       await fetchAndStoreRealtimeData();
     } catch (err) {
       console.error('BT realtime fetch error:', err.message || err);
+    } finally {
+      _btFetchRunning = false;
     }
   }, { scheduled: true });
 
@@ -574,4 +543,4 @@ function scheduleAllJobs() {
   console.log('All cron jobs scheduled');
 }
 
-module.exports = { scheduleAllJobs, scheduleUserJobs, userCrons, sendMorningBrief, runNightlyPlanning, buildMorningBriefPrompt };
+module.exports = { scheduleAllJobs, scheduleUserJobs, userCrons, sendMorningBrief, buildMorningBriefPrompt };

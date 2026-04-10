@@ -3,9 +3,10 @@
 require('dotenv').config();
 
 const express = require('express');
-const { launch, newPage, closeBrowser } = require('./browser');
+const { launch, newContext, newPage, closeContext, closeBrowser } = require('./browser');
 const { planTask } = require('./planner');
-const { executePlan } = require('./executor');
+const { executePlan, getAriaSnapshot, isSsrfTarget } = require('./executor');
+const { ensureTable, hostnameFromUrl, loadSession, saveSession, clearSession, listSessions } = require('./sessions');
 const {
   createTask,
   getTask,
@@ -16,11 +17,15 @@ const {
   decrementActive,
   enqueue,
   drainQueue,
+  getTaskCount,
 } = require('./tasks');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const TASK_TIMEOUT_MS = 90_000;
+
+// Default 4 min; tasks may request up to 10 min via timeoutMs body field.
+const DEFAULT_TIMEOUT_MS = Number(process.env.DEFAULT_TASK_TIMEOUT_MS) || 240_000;
+const MAX_TIMEOUT_MS = 600_000;
 
 app.use(express.json());
 
@@ -28,7 +33,7 @@ app.use(express.json());
 
 function requireAuth(req, res, next) {
   const secret = process.env.AGENT_SECRET;
-  if (!secret) return next(); // no secret configured → open (dev only)
+  if (!secret) return next();
 
   const header = req.headers.authorization ?? '';
   if (!header.startsWith('Bearer ') || header.slice(7) !== secret) {
@@ -40,7 +45,7 @@ function requireAuth(req, res, next) {
 // ─── GET /health ──────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', activeTasks: getActiveCount() });
+  res.json({ status: 'ok', activeTasks: getActiveCount(), totalTasks: getTaskCount() });
 });
 
 // ─── GET /.well-known/agent.json ──────────────────────────────────────────────
@@ -48,40 +53,82 @@ app.get('/health', (req, res) => {
 app.get('/.well-known/agent.json', (req, res) => {
   res.json({
     name: 'playwright-agent',
-    version: '1.0.0',
-    capabilities: ['web_search', 'form_fill', 'page_scrape', 'click_navigate', 'screenshot'],
+    version: '1.3.0',
+    capabilities: [
+      'web_search', 'form_fill', 'page_scrape', 'scrape_list',
+      'click_navigate', 'screenshot', 'dropdown_select',
+      'keyboard_input', 'hover', 'smart_wait', 'self_healing',
+      'table_extract', 'js_evaluate', 'iframe_support',
+      'network_wait', 'scroll_to_element', 'login_flows',
+      'multi_step_forms', 'pagination', 'spa_support',
+      'persistent_sessions',
+    ],
     endpoint: `${process.env.PUBLIC_URL || `http://localhost:${PORT}`}/tasks`,
   });
 });
 
-// ─── Core task runner (async, called after POST /tasks returns) ───────────────
+// ─── Core task runner ─────────────────────────────────────────────────────────
 
 async function runTask(taskId) {
   const task = getTask(taskId);
   if (!task) return;
 
+  let context = null;
   let page = null;
   incrementActive();
   updateTask(taskId, { status: 'running' });
 
-  // Hard timeout: close the page after 90 s which causes all pending
-  // Playwright calls to reject, then the catch block handles cleanup.
   let timeoutHandle = null;
 
+  // Determine the primary hostname from the task description so we can load
+  // and save the right session.
+  const urlMatch = task.description.match(/https?:\/\/[^\s,)"']+/i);
+  const startUrl = urlMatch ? urlMatch[0].replace(/[.,;:!?]+$/, '') : null;
+  const sessionHostname = hostnameFromUrl(startUrl);
+
   try {
-    const steps = await planTask(task.description, task.context);
+    // ── Phase 0: load saved session (if any) ─────────────────────────────────
+    let storageState = null;
+    if (task.userId && sessionHostname) {
+      storageState = await loadSession(task.userId, sessionHostname);
+      if (storageState) {
+        console.log(`[runTask] loaded session for ${task.userId}@${sessionHostname}`);
+        updateTask(taskId, { sessionLoaded: true, sessionHostname });
+      }
+    }
+
+    // ── Phase 1: create context + page ───────────────────────────────────────
+    context = await newContext(storageState);
+    page = await newPage(context);
+
+    // ── Phase 2: pre-navigate if the description contains a URL ──────────────
+    if (startUrl && !isSsrfTarget(startUrl)) {
+      try {
+        await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      } catch (e) {
+        console.warn(`[runTask] pre-navigate failed (non-fatal): ${e.message}`);
+      }
+    }
+
+    // ── Phase 3: snapshot the ARIA tree and feed it to the planner ────────────
+    const ariaSnapshot = await getAriaSnapshot(page);
+    const steps = await planTask(task.description, task.context, ariaSnapshot);
 
     if (task.cancelled) {
       updateTask(taskId, { status: 'cancelled', error: 'Task cancelled before execution' });
       return;
     }
 
-    page = await newPage();
+    // ── Phase 4: execute with timeout ────────────────────────────────────────
+    const timeoutMs = Math.min(
+      Math.max(Number(task.timeoutMs) || DEFAULT_TIMEOUT_MS, 30_000),
+      MAX_TIMEOUT_MS
+    );
 
     const timeoutPromise = new Promise((_, reject) => {
       timeoutHandle = setTimeout(() => {
-        reject(new Error(`Task timed out after ${TASK_TIMEOUT_MS / 1000}s`));
-      }, TASK_TIMEOUT_MS);
+        reject(new Error(`Task timed out after ${timeoutMs / 1000}s`));
+      }, timeoutMs);
     });
 
     const { results, screenshots } = await Promise.race([
@@ -94,6 +141,7 @@ async function runTask(taskId) {
       result: { steps, results },
       screenshots,
     });
+
   } catch (err) {
     // Best-effort error screenshot
     const errorScreenshots = [];
@@ -109,11 +157,25 @@ async function runTask(taskId) {
       error: err.message,
       screenshots: errorScreenshots,
     });
+
   } finally {
     clearTimeout(timeoutHandle);
-    if (page) await page.close().catch(() => {});
+
+    // ── Always save the session state, even on failure ────────────────────────
+    // A partially-completed auth flow (e.g. got through SSO but hit a timeout)
+    // still has useful cookies that can be reused on the next attempt.
+    if (context && task.userId && sessionHostname) {
+      try {
+        const updatedState = await context.storageState();
+        await saveSession(task.userId, sessionHostname, updatedState);
+      } catch (err) {
+        console.warn(`[runTask] session save failed for ${sessionHostname}:`, err.message);
+      }
+    }
+
+    await closeContext(context);
     decrementActive();
-    drainQueue(); // give the next queued task a slot
+    drainQueue();
   }
 }
 
@@ -121,7 +183,6 @@ function scheduleTask(taskId) {
   if (atCapacity()) {
     enqueue(() => runTask(taskId));
   } else {
-    // Run on next tick so POST /tasks can return first
     setImmediate(() => runTask(taskId));
   }
 }
@@ -129,7 +190,7 @@ function scheduleTask(taskId) {
 // ─── POST /tasks ──────────────────────────────────────────────────────────────
 
 app.post('/tasks', requireAuth, (req, res) => {
-  const { taskId, description, context, userId } = req.body ?? {};
+  const { taskId, description, context, userId, timeoutMs } = req.body ?? {};
 
   if (!taskId || typeof taskId !== 'string') {
     return res.status(400).json({ error: 'taskId is required' });
@@ -144,10 +205,10 @@ app.post('/tasks', requireAuth, (req, res) => {
     return res.status(409).json({ error: 'taskId already exists' });
   }
 
-  createTask(taskId, userId, description, context);
+  createTask(taskId, userId, description, context, timeoutMs);
   scheduleTask(taskId);
 
-  res.status(202).json({ taskId, status: 'running' });
+  res.status(202).json({ taskId, status: 'queued' });
 });
 
 // ─── GET /tasks/:taskId ───────────────────────────────────────────────────────
@@ -156,8 +217,8 @@ app.get('/tasks/:taskId', requireAuth, (req, res) => {
   const task = getTask(req.params.taskId);
   if (!task) return res.status(404).json({ error: 'Task not found' });
 
-  const { taskId, status, result, error, screenshots } = task;
-  res.json({ taskId, status, result, error, screenshots });
+  const { taskId, status, result, error, screenshots, sessionLoaded, sessionHostname } = task;
+  res.json({ taskId, status, result, error, screenshots, sessionLoaded, sessionHostname });
 });
 
 // ─── POST /tasks/:taskId/cancel ───────────────────────────────────────────────
@@ -166,7 +227,7 @@ app.post('/tasks/:taskId/cancel', requireAuth, (req, res) => {
   const task = getTask(req.params.taskId);
   if (!task) return res.status(404).json({ error: 'Task not found' });
 
-  if (task.status === 'done' || task.status === 'error' || task.status === 'cancelled') {
+  if (['done', 'error', 'cancelled'].includes(task.status)) {
     return res.json({ taskId: task.taskId, status: task.status, message: 'Task already finished' });
   }
 
@@ -174,10 +235,46 @@ app.post('/tasks/:taskId/cancel', requireAuth, (req, res) => {
   res.json({ taskId: task.taskId, status: 'cancelled' });
 });
 
+// ─── Session management ───────────────────────────────────────────────────────
+
+// GET /sessions/:userId — list all saved sessions for a user
+app.get('/sessions/:userId', requireAuth, async (req, res) => {
+  try {
+    const sessions = await listSessions(req.params.userId);
+    res.json({ userId: req.params.userId, sessions });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /sessions/:userId/:hostname — clear a specific saved session
+// Useful when a user changes their password or explicitly logs out.
+app.delete('/sessions/:userId/:hostname', requireAuth, async (req, res) => {
+  try {
+    await clearSession(req.params.userId, req.params.hostname);
+    res.json({ ok: true, userId: req.params.userId, hostname: req.params.hostname });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /sessions/:userId — clear ALL saved sessions for a user
+app.delete('/sessions/:userId', requireAuth, async (req, res) => {
+  try {
+    const sessions = await listSessions(req.params.userId);
+    for (const s of sessions) {
+      await clearSession(req.params.userId, s.hostname);
+    }
+    res.json({ ok: true, userId: req.params.userId, cleared: sessions.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Startup ──────────────────────────────────────────────────────────────────
 
 async function startup() {
-  // Pre-launch the browser so the first task doesn't pay the cold-start cost
+  await ensureTable();
   await launch();
 
   app.listen(PORT, () => {

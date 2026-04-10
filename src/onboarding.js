@@ -83,6 +83,7 @@ async function validateCanvasToken(canvasBaseUrl, token) {
   try {
     const response = await fetch(`${canvasBaseUrl}/api/v1/users/self`, {
       headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(10_000),
     });
     return response.ok;
   } catch {
@@ -259,14 +260,22 @@ async function handleStep8(userId, phone, message) {
 async function completeOnboarding(userId, phone, name) {
   await db.updateUser(userId, { onboarding_complete: true, onboarding_step: 9 });
 
-  const tomorrow8am = new Date();
-  tomorrow8am.setDate(tomorrow8am.getDate() + 1);
-  tomorrow8am.setHours(8, 0, 0, 0);
-  await db.scheduleMessage(userId, tomorrow8am, 'morning brief', {}, 'morning_brief');
+  // Use user's preferred brief time — they just set it in step 8
+  const user = await db.getUserById(userId);
+  const briefHour = user?.preferred_brief_hour ?? 8;
+  const briefMinute = user?.preferred_brief_minute ?? 0;
+  const tomorrowBrief = new Date();
+  tomorrowBrief.setDate(tomorrowBrief.getDate() + 1);
+  tomorrowBrief.setHours(briefHour, briefMinute, 0, 0);
+  await db.scheduleMessage(userId, tomorrowBrief, 'morning brief', {}, 'morning_brief');
+
+  const timeDisplay = briefMinute > 0
+    ? `${briefHour % 12 || 12}:${String(briefMinute).padStart(2, '0')}${briefHour < 12 ? 'am' : 'pm'}`
+    : `${briefHour % 12 || 12}${briefHour < 12 ? 'am' : 'pm'}`;
 
   await sendMultiple(phone, [
-    `you're all set ${name || ''}! 🎉`,
-    "i'll text you tomorrow morning with your day — classes, assignments, anything that needs attention",
+    `you're all set ${name || ''}!`,
+    `i'll text you tomorrow at ${timeDisplay} with your day — classes, assignments, anything that needs attention`,
     "text me anytime — i'm always here",
   ], userId);
 }
@@ -286,7 +295,7 @@ async function handleOnboardingMessage(user, message) {
     case 6:  return handleStep6(userId, phone, message);
     case 7:  return handleStep7(userId, phone, message, user);
     case 8:  return handleStep8(userId, phone, message);
-    case 9:  return completeOnboarding(userId, phone, user.name);
+    case 9:  return sendMessage(phone, "you're already all set! text me anything — i'm here", userId);
     default: return handleStep0(userId, phone);
   }
 }

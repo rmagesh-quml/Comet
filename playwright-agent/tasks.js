@@ -10,17 +10,20 @@ const runQueue = []; // functions waiting for a slot
 
 // ─── CRUD ─────────────────────────────────────────────────────────────────────
 
-function createTask(taskId, userId, description, context) {
+function createTask(taskId, userId, description, context, timeoutMs) {
   const task = {
     taskId,
     userId,
     description,
     context: context || null,
+    timeoutMs: timeoutMs || null,
     status: 'pending',
     result: null,
     error: null,
     screenshots: [],
     cancelled: false,
+    sessionLoaded: false,
+    sessionHostname: null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
@@ -69,6 +72,30 @@ function drainQueue() {
   }
 }
 
+// ─── TTL cleanup ──────────────────────────────────────────────────────────────
+// Completed/failed tasks are kept for 2 hours so callers can poll the result,
+// then evicted to prevent unbounded memory growth.
+
+const TASK_TTL_MS = 2 * 60 * 60 * 1000;
+
+function pruneOldTasks() {
+  const cutoff = Date.now() - TASK_TTL_MS;
+  for (const [id, task] of taskMap.entries()) {
+    if (['done', 'error', 'cancelled'].includes(task.status)) {
+      if (new Date(task.updatedAt).getTime() < cutoff) {
+        taskMap.delete(id);
+      }
+    }
+  }
+}
+
+// Run cleanup every 30 minutes without keeping the process alive
+setInterval(pruneOldTasks, 30 * 60 * 1000).unref();
+
+function getTaskCount() {
+  return taskMap.size;
+}
+
 module.exports = {
   MAX_CONCURRENT,
   createTask,
@@ -80,4 +107,6 @@ module.exports = {
   decrementActive,
   enqueue,
   drainQueue,
+  getTaskCount,
+  pruneOldTasks,
 };

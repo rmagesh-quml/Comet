@@ -24,9 +24,9 @@ function hashContextKey(key) {
 // ─── Confidence gate ──────────────────────────────────────────────────────────
 
 async function shouldSendProactive(userId, triggerType, contextKey = '', opts = {}) {
-  // Hard block: quiet hours (midnight–7am)
+  // Hard block: quiet hours (10pm–7am)
   const hour = new Date().getHours();
-  if (hour < 8) {
+  if (hour < 8 || hour >= 22) {
     return { send: false, reason: 'quiet_hours' };
   }
 
@@ -431,7 +431,9 @@ async function nightlyPlan(userId) {
       return;
     }
 
+    let scheduled = 0;
     for (const trigger of triggers) {
+      if (scheduled >= 2) break; // cap at 2 AI-planned messages per night to control cost
       if (!trigger.triggerTime || !trigger.purpose || !trigger.triggerType) continue;
       const triggerTime = new Date(trigger.triggerTime);
       if (isNaN(triggerTime.getTime())) continue;
@@ -443,6 +445,7 @@ async function nightlyPlan(userId) {
         { contextSummary: trigger.contextSummary || '', contextKey: '' },
         trigger.triggerType
       );
+      scheduled++;
     }
 
     // Grade change alert

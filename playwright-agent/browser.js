@@ -14,15 +14,17 @@ async function launch() {
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage', // critical in Docker to avoid /dev/shm exhaustion
+      '--disable-dev-shm-usage',                 // critical in Docker
       '--disable-gpu',
       '--disable-extensions',
-      '--single-process',        // reduces memory in containers
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
     ],
   });
 
   _browser.on('disconnected', () => {
-    console.warn('Browser disconnected — will relaunch on next page request');
+    console.warn('Browser disconnected — will relaunch on next request');
     _browser = null;
   });
 
@@ -30,16 +32,38 @@ async function launch() {
   return _browser;
 }
 
-// Returns a fresh page with a standard viewport. Automatically relaunches
-// the browser singleton if it crashed/disconnected.
-async function newPage() {
+// ─── Context management ───────────────────────────────────────────────────────
+// Each task gets its own BrowserContext so sessions are isolated.
+// Pass a Playwright storageState to pre-seed cookies and localStorage
+// (e.g. from a saved database session).
+
+async function newContext(storageState = null) {
   const browser = await launch();
-  const page = await browser.newPage();
-  await page.setViewportSize({ width: 1280, height: 720 });
-  // Suppress noisy console output from pages
+  const opts = {
+    viewport: { width: 1280, height: 720 },
+    // Mimic a real Chrome user-agent to avoid trivial bot detection
+    userAgent:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+      'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+      'Chrome/124.0.0.0 Safari/537.36',
+    locale: 'en-US',
+    timezoneId: 'America/New_York',
+  };
+  if (storageState) opts.storageState = storageState;
+  return browser.newContext(opts);
+}
+
+// Returns a fresh page inside an existing context.
+async function newPage(context) {
+  const page = await context.newPage();
   page.on('console', () => {});
   page.on('pageerror', () => {});
   return page;
+}
+
+// Close a context and all pages inside it.
+async function closeContext(context) {
+  if (context) await context.close().catch(() => {});
 }
 
 async function closeBrowser() {
@@ -50,4 +74,4 @@ async function closeBrowser() {
   }
 }
 
-module.exports = { launch, newPage, closeBrowser };
+module.exports = { launch, newContext, newPage, closeContext, closeBrowser };
