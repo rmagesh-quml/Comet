@@ -173,20 +173,23 @@ describe('scheduleUserJobs', () => {
     expect(secondJobs).not.toBe(firstJobs);
   });
 
-  it('creates nightly digest job at 9pm', () => {
+  it('does NOT create nightly digest job per-user (moved to global fan-out)', () => {
+    // Nightly digest is now a single global cron that fans out to all users,
+    // rather than one cron per user. This is intentional for scalability.
     const user = { id: 1, timezone: 'America/New_York', preferred_brief_hour: 9 };
     scheduler.scheduleUserJobs(user);
     const jobs = scheduler.userCrons.get(1);
     const digestJob = jobs.find(j => j.expression === '0 21 * * *');
-    expect(digestJob).toBeTruthy();
+    expect(digestJob).toBeFalsy();
   });
 
-  it('creates nightly extraction job at 2:30am', () => {
+  it('does NOT create nightly extraction job per-user (moved to global fan-out)', () => {
+    // Memory extraction is now a single global cron that fans out to all users.
     const user = { id: 1, timezone: 'America/New_York', preferred_brief_hour: 9 };
     scheduler.scheduleUserJobs(user);
     const jobs = scheduler.userCrons.get(1);
     const extractJob = jobs.find(j => j.expression === '30 2 * * *');
-    expect(extractJob).toBeTruthy();
+    expect(extractJob).toBeFalsy();
   });
 });
 

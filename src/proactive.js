@@ -4,10 +4,27 @@ const db = require('./db');
 const { classify, generateUserMessage } = require('./utils/claude');
 const { sendMessage, sendTypingIndicator, sendReaction, sendMultiple } = require('./sms');
 const { isInClass, getFreeBlocksToday, getClassSchedule } = require('./integrations/schedule');
-const { getWeeklySnapshot, detectGradeChanges } = require('./integrations/canvas');
+const { getWeeklySnapshot, detectGradeChanges, getUpcomingAssignments } = require('./integrations/canvas');
 const { getTodaysEvents, getUpcomingEvents } = require('./integrations/outlook');
+const { getGoogleCalendarEvents } = require('./integrations/gmail');
 const { getMoodContext } = require('./integrations/spotify');
 const { getTodaysForecast } = require('./integrations/weather');
+const { isOnBreak } = require('./utils/academicCalendar');
+
+// ─── Retry helper ─────────────────────────────────────────────────────────────
+// Retries an async fn up to `retries` times with exponential backoff.
+// Throws on final failure so callers can decide how to handle it.
+
+async function withRetry(fn, retries = 2, baseDelayMs = 800) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt === retries) throw err;
+      await new Promise(r => setTimeout(r, baseDelayMs * Math.pow(2, attempt)));
+    }
+  }
+}
 
 // ─── Context key hashing (djb2) ───────────────────────────────────────────────
 
@@ -24,7 +41,13 @@ function hashContextKey(key) {
 // ─── Confidence gate ──────────────────────────────────────────────────────────
 
 async function shouldSendProactive(userId, triggerType, contextKey = '', opts = {}) {
-  // Hard block: quiet hours (10pm–7am)
+  // opts.force bypasses all gates (for admin/testing only)
+  if (opts.force) {
+    const contextHash = hashContextKey(contextKey);
+    return { send: true, contextHash };
+  }
+
+  // Hard block: quiet hours (10pm–8am)
   const hour = new Date().getHours();
   if (hour < 8 || hour >= 22) {
     return { send: false, reason: 'quiet_hours' };
@@ -50,12 +73,23 @@ async function shouldSendProactive(userId, triggerType, contextKey = '', opts = 
     }
   }
 
-  // Preference check
+  // Preference check with time-decay: recent feedback (14 days) weighted 2x
   const contextHash = hashContextKey(contextKey);
-  const pref = await db.getPreference(userId, triggerType, contextHash);
+  const [pref, recentPref] = await Promise.all([
+    db.getPreference(userId, triggerType, contextHash),
+    db.query(
+      `SELECT positive_count, total_count FROM user_preferences
+       WHERE user_id = $1 AND trigger_type = $2 AND context_hash = $3
+         AND updated_at >= NOW() - INTERVAL '14 days'`,
+      [userId, triggerType, contextHash]
+    ).then(r => r.rows[0] || null).catch(() => null),
+  ]);
 
   if (pref && pref.total_count >= 5) {
-    const positiveRate = pref.positive_count / pref.total_count;
+    // Weight recent feedback 2x
+    const allPos   = pref.positive_count   + (recentPref ? recentPref.positive_count   : 0);
+    const allTotal = pref.total_count      + (recentPref ? recentPref.total_count      : 0);
+    const positiveRate = allPos / allTotal;
     if (positiveRate < 0.4) {
       await db.logSentMessage(userId, `proactive:${triggerType}:${contextHash}`, '', 'skipped');
       return { send: false, reason: 'negative_preference', contextHash };
@@ -101,8 +135,9 @@ async function canvasAlert(userId) {
 
   let snapshot;
   try {
-    snapshot = await getWeeklySnapshot(userId);
-  } catch {
+    snapshot = await withRetry(() => getWeeklySnapshot(userId));
+  } catch (err) {
+    console.warn(`canvasAlert: Canvas unavailable for user ${userId}:`, err.message || err);
     return;
   }
 
@@ -113,9 +148,18 @@ async function canvasAlert(userId) {
   const isMonday9am = now.getDay() === 1 && now.getHours() === 9;
   const weeklyAssignments = snapshot.upcoming || [];
 
+  // Detect assignment bunching: 3+ assignments due on the same calendar day
+  const dueDateCounts = new Map();
+  for (const a of weeklyAssignments) {
+    const day = a.dueDate ? a.dueDate.split('T')[0] : null;
+    if (day) dueDateCounts.set(day, (dueDateCounts.get(day) || 0) + 1);
+  }
+  const hasBunchDay = [...dueDateCounts.values()].some(count => count >= 3);
+
   const shouldFire =
     dueSoon.length >= 2 ||
     missing.length > 0 ||
+    hasBunchDay ||
     (isMonday9am && weeklyAssignments.length >= 3);
 
   if (!shouldFire) return;
@@ -123,7 +167,9 @@ async function canvasAlert(userId) {
   let freeBlocks = [];
   try {
     freeBlocks = await getFreeBlocksToday(userId);
-  } catch { /* skip */ }
+  } catch (err) {
+    console.warn(`canvasAlert: could not get free blocks for user ${userId}:`, err.message || err);
+  }
 
   const context = {
     dueSoon: dueSoon.map(a => `${a.title} (${a.courseName}, due ${new Date(a.dueDate).toLocaleDateString()})`),
@@ -181,13 +227,17 @@ async function healthNudge(userId) {
   try {
     const reading = await db.getLatestHealthReading(userId);
     readiness = reading?.readiness ?? null;
-  } catch { /* no reading */ }
+  } catch (err) {
+    console.warn(`healthNudge: could not get health reading for user ${userId}:`, err.message || err);
+  }
 
   let todayEventCount = 0;
   try {
     const events = await getTodaysEvents(userId);
     todayEventCount = (events || []).length;
-  } catch { /* skip */ }
+  } catch (err) {
+    console.warn(`healthNudge: could not get events for user ${userId}:`, err.message || err);
+  }
 
   let consecutiveLow = 0;
   try {
@@ -195,7 +245,9 @@ async function healthNudge(userId) {
     if (readings.length === 3 && readings.every(r => r.readiness < 55)) {
       consecutiveLow = 3;
     }
-  } catch { /* skip */ }
+  } catch (err) {
+    console.warn(`healthNudge: could not get health readings for user ${userId}:`, err.message || err);
+  }
 
   const shouldFire =
     (readiness !== null && readiness < 55 && todayEventCount >= 3) ||
@@ -239,19 +291,25 @@ async function nightlyDigest(userId) {
     tomorrow.setDate(tomorrow.getDate() + 1);
     const tomorrowStr = tomorrow.toISOString().split('T')[0];
     tomorrowEvents = tomorrowEvents.filter(e => e.start && e.start.startsWith(tomorrowStr));
-  } catch { /* skip */ }
+  } catch (err) {
+    console.warn(`nightlyDigest: could not get upcoming events for user ${userId}:`, err.message || err);
+  }
 
   try {
-    const snapshot = await getWeeklySnapshot(userId);
+    const snapshot = await withRetry(() => getWeeklySnapshot(userId));
     const tomorrowEnd = new Date();
     tomorrowEnd.setDate(tomorrowEnd.getDate() + 2);
     tomorrowEnd.setHours(23, 59, 59, 0);
     dueTomorrow = (snapshot.upcoming || []).filter(a => new Date(a.dueDate) <= tomorrowEnd);
-  } catch { /* skip */ }
+  } catch (err) {
+    console.warn(`nightlyDigest: Canvas unavailable for user ${userId}:`, err.message || err);
+  }
 
   try {
     forecast = await getTodaysForecast(userId);
-  } catch { /* skip */ }
+  } catch (err) {
+    console.warn(`nightlyDigest: could not get forecast for user ${userId}:`, err.message || err);
+  }
 
   const context = {
     name: user.name || '',
@@ -275,6 +333,116 @@ Context: ${JSON.stringify(context)}`,
   } else {
     await sendMessage(user.phone_number, response, userId);
   }
+}
+
+// ─── Exam countdown ───────────────────────────────────────────────────────────
+// Fires once within 48h of any assignment named like an exam/quiz.
+
+const EXAM_KEYWORDS = ['exam', 'midterm', 'final', 'quiz', 'test'];
+
+async function examCountdown(userId) {
+  if (isOnBreak()) return; // no exam alerts during breaks
+
+  const user = await db.getUserById(userId);
+  if (!user || !user.canvas_token) return;
+
+  let upcoming = [];
+  try {
+    upcoming = await withRetry(() => getUpcomingAssignments(userId, 2)); // next 48h
+  } catch (err) {
+    console.warn(`examCountdown: Canvas unavailable for user ${userId}:`, err.message || err);
+    return;
+  }
+
+  const exams = upcoming.filter(a =>
+    EXAM_KEYWORDS.some(kw => a.title.toLowerCase().includes(kw))
+  );
+
+  for (const exam of exams.slice(0, 2)) {
+    const gate = await shouldSendProactive(userId, 'exam_countdown', exam.title);
+    if (!gate.send) continue;
+
+    const dueDate = new Date(exam.dueDate);
+    const hoursOut = Math.round((dueDate - new Date()) / 3600000);
+    const timeStr = hoursOut <= 24
+      ? 'tomorrow'
+      : dueDate.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+
+    const message = await generateUserMessage(
+      `You are a supportive friend texting a college student. Send a brief, warm good-luck message for an upcoming exam. 1 sentence max. No lecture.
+Exam: ${exam.title}
+Course: ${exam.courseName}
+Due: ${timeStr}`,
+      [{ role: 'user', content: `exam reminder` }],
+      200, 'proactive'
+    );
+
+    await sendTypingIndicator(user.phone_number, userId);
+    await sendMessage(user.phone_number, message, userId);
+  }
+}
+
+// ─── Conflict detection ────────────────────────────────────────────────────────
+// Cross-references Canvas due dates with calendar events to surface busy days.
+
+async function detectConflicts(userId) {
+  const user = await db.getUserById(userId);
+  if (!user) return;
+
+  let assignments = [];
+  let events = [];
+
+  try {
+    const snap = await withRetry(() => getWeeklySnapshot(userId));
+    assignments = snap.upcoming || [];
+  } catch (err) {
+    console.warn(`detectConflicts: Canvas unavailable for user ${userId}:`, err.message || err);
+    return;
+  }
+
+  try {
+    const [outlookEvents, googleEvents] = await Promise.allSettled([
+      getTodaysEvents(userId),
+      getGoogleCalendarEvents(userId, 7),
+    ]);
+    events = [
+      ...(outlookEvents.status === 'fulfilled' ? outlookEvents.value || [] : []),
+      ...(googleEvents.status === 'fulfilled'  ? googleEvents.value  || [] : []),
+    ];
+  } catch (err) {
+    console.warn(`detectConflicts: calendar unavailable for user ${userId}:`, err.message || err);
+  }
+
+  // Group events by date
+  const eventsByDate = new Map();
+  for (const e of events) {
+    if (!e.start) continue;
+    const day = e.start.split('T')[0];
+    eventsByDate.set(day, (eventsByDate.get(day) || 0) + 1);
+  }
+
+  // Find assignment due dates with 5+ calendar events the same day
+  const conflicts = assignments.filter(a => {
+    const day = a.dueDate ? a.dueDate.split('T')[0] : null;
+    return day && (eventsByDate.get(day) || 0) >= 5;
+  });
+
+  if (conflicts.length === 0) return;
+
+  const gate = await shouldSendProactive(userId, 'conflict_alert');
+  if (!gate.send) return;
+
+  const conflictList = conflicts.slice(0, 2)
+    .map(a => `${a.title} (${a.courseName})`).join(' and ');
+
+  const message = await generateUserMessage(
+    `You are a caring friend. Alert a college student that they have a packed day coming up. 2 sentences max, casual, actionable.
+Conflict: ${conflictList} due on a day with many calendar events. Help them plan ahead.`,
+    [{ role: 'user', content: 'heads up' }],
+    300, 'proactive'
+  );
+
+  await sendMessage(user.phone_number, message, userId);
 }
 
 // ─── Scheduled trigger processor ──────────────────────────────────────────────
@@ -424,10 +592,16 @@ async function nightlyPlan(userId) {
 
     let triggers = [];
     try {
-      const raw = await classify(prompt, 500, 'classification');
-      const parsed = JSON.parse(raw.trim());
-      if (Array.isArray(parsed)) triggers = parsed;
-    } catch {
+      const raw = await withRetry(() => classify(prompt, 500, 'classification'));
+      try {
+        const parsed = JSON.parse(raw.trim());
+        if (Array.isArray(parsed)) triggers = parsed;
+      } catch (parseErr) {
+        console.warn(`nightlyPlan: JSON parse failed for user ${userId}:`, parseErr.message, '| raw:', (raw || '').slice(0, 100));
+        return;
+      }
+    } catch (err) {
+      console.warn(`nightlyPlan: classify failed for user ${userId}:`, err.message || err);
       return;
     }
 
@@ -462,7 +636,9 @@ async function nightlyPlan(userId) {
           }
         }
       }
-    } catch { /* grade check is best-effort */ }
+    } catch (err) {
+      console.warn(`nightlyPlan: grade check failed for user ${userId}:`, err.message || err);
+    }
 
   } catch (err) {
     console.error(`nightlyPlan error for user ${userId}:`, err.message || err);
@@ -470,12 +646,15 @@ async function nightlyPlan(userId) {
 }
 
 module.exports = {
+  withRetry,
   shouldSendProactive,
   eventReminder,
   canvasAlert,
   importantEmailAlert,
   healthNudge,
   nightlyDigest,
+  examCountdown,
+  detectConflicts,
   processPendingTriggers,
   checkUpcomingEvents,
   nightlyPlan,

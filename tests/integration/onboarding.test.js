@@ -11,10 +11,13 @@ const mockDetectAndUpdateMessagingService = jest.fn().mockResolvedValue(undefine
 
 jest.mock('../../src/sms', () => ({
   isLinqAvailable: (...args) => mockIsLinqAvailable(...args),
+  isTelegramAvailable: jest.fn().mockReturnValue(false),
   verifyLinqWebhook: jest.fn((req, res, next) => next()),
+  verifyTelegramWebhook: jest.fn((req, res, next) => next()),
   sendMessage: (...args) => mockSendMessage(...args),
   detectAndUpdateMessagingService: (...args) => mockDetectAndUpdateMessagingService(...args),
   registerLinqWebhook: jest.fn().mockResolvedValue(undefined),
+  registerTelegramWebhook: jest.fn().mockResolvedValue(undefined),
 }));
 
 const mockGetResponse = jest.fn().mockResolvedValue('sure thing!');

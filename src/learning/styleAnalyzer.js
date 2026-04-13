@@ -4,7 +4,7 @@ const db = require('../db');
 const { classify } = require('../utils/claude');
 const cache = require('../utils/cache');
 
-const STYLE_CACHE_TTL = 10080; // 7 days in minutes
+const STYLE_CACHE_TTL = 4320; // 3 days in minutes (was 7 — adapts faster to style changes)
 
 async function analyzeUserStyle(userId) {
   const result = await db.query(
@@ -33,7 +33,39 @@ async function analyzeUserStyle(userId) {
   }
 
   cache.set(cacheKey, parsed, STYLE_CACHE_TTL);
+
+  // Persist concrete format preference to user_preferences so brain.js can read it
+  // without re-analyzing style on every message.
+  if (parsed.prefersResponses === 'brief' && parsed.averageLength === 'short') {
+    db.query(
+      `INSERT INTO user_preferences (user_id, trigger_type, context_hash, positive_count, total_count, updated_at)
+       VALUES ($1, 'response_format', 'format', 1, 1, NOW())
+       ON CONFLICT (user_id, trigger_type, context_hash) DO UPDATE SET
+         positive_count = user_preferences.positive_count + 1,
+         total_count = user_preferences.total_count + 1,
+         updated_at = NOW()`,
+      [userId]
+    ).catch(() => {}); // fire and forget
+  }
+
   return parsed;
+}
+
+// ─── Response format hint ─────────────────────────────────────────────────────
+// Reads the learned format preference for a user.
+// Returns 'brief' | 'detailed' | null.
+
+async function getResponseFormatHint(userId) {
+  try {
+    const pref = await db.getPreferenceByType(userId, 'response_format');
+    if (!pref || pref.total_count < 3) return null; // not enough signal yet
+    const rate = pref.positive_count / pref.total_count;
+    if (rate >= 0.6) return 'brief';
+    if (rate <= 0.3) return 'detailed';
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function formatStyleContext(style) {
@@ -60,4 +92,4 @@ async function refreshStyleCache(userId) {
   return analyzeUserStyle(userId);
 }
 
-module.exports = { analyzeUserStyle, formatStyleContext, getStyleContext, refreshStyleCache };
+module.exports = { analyzeUserStyle, formatStyleContext, getStyleContext, getResponseFormatHint, refreshStyleCache };

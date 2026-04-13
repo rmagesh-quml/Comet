@@ -487,53 +487,24 @@ describe('onboarding', () => {
     });
   });
 
-  // ─── Step 9 — Complete ────────────────────────────────────────────────────────
+  // ─── Step 9 — Already onboarded ─────────────────────────────────────────────
+  // Step 9 is set after completeOnboarding runs (from step 8). If someone texts
+  // again after onboarding, step 9 just sends a friendly "already set" message.
 
-  describe('step 9 — complete', () => {
-    it('sets onboarding_complete to true', async () => {
+  describe('step 9 — already onboarded', () => {
+    it('sends a single "already set" message', async () => {
       await onboarding.handleOnboardingMessage(makeUser(9), 'anything');
 
-      expect(db.updateUser).toHaveBeenCalledWith(
-        1, expect.objectContaining({ onboarding_complete: true })
-      );
+      expect(sms.sendMessage).toHaveBeenCalledTimes(1);
+      const msg = sms.sendMessage.mock.calls[0][1];
+      expect(msg).toMatch(/already all set/i);
     });
 
-    it('schedules morning brief for tomorrow at 8am', async () => {
+    it('does not call updateUser or scheduleMessage', async () => {
       await onboarding.handleOnboardingMessage(makeUser(9), 'anything');
 
-      expect(db.scheduleMessage).toHaveBeenCalledTimes(1);
-      const [userId, triggerTime, , , triggerType] = db.scheduleMessage.mock.calls[0];
-      expect(userId).toBe(1);
-      expect(triggerType).toBe('morning_brief');
-
-      // Verify it's tomorrow at 8:00am
-      const tomorrow = new Date();
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      tomorrow.setHours(8, 0, 0, 0);
-      expect(triggerTime.getDate()).toBe(tomorrow.getDate());
-      expect(triggerTime.getHours()).toBe(8);
-      expect(triggerTime.getMinutes()).toBe(0);
-    });
-
-    it('sends three completion messages', async () => {
-      await onboarding.handleOnboardingMessage(makeUser(9), 'anything');
-
-      expect(sms.sendMessage).toHaveBeenCalledTimes(3);
-    });
-
-    it('first message includes user name and 🎉', async () => {
-      await onboarding.handleOnboardingMessage(makeUser(9), 'anything');
-
-      const firstMsg = sms.sendMessage.mock.calls[0][1];
-      expect(firstMsg).toContain('Alex');
-      expect(firstMsg).toContain('🎉');
-    });
-
-    it('messages mention tomorrow morning', async () => {
-      await onboarding.handleOnboardingMessage(makeUser(9), 'anything');
-
-      const allText = sms.sendMessage.mock.calls.map(c => c[1]).join(' ');
-      expect(allText).toMatch(/tomorrow/i);
+      expect(db.updateUser).not.toHaveBeenCalled();
+      expect(db.scheduleMessage).not.toHaveBeenCalled();
     });
   });
 

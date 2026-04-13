@@ -30,6 +30,44 @@ async function canvasFetch(userId, endpoint) {
   }
 }
 
+// ─── Paginated fetcher ────────────────────────────────────────────────────────
+// Follows Canvas Link: rel="next" headers to retrieve all pages.
+// Returns a flat array of all items across all pages.
+// maxPages guards against infinite loops on misconfigured endpoints.
+
+async function canvasFetchAll(userId, endpoint, maxPages = 10) {
+  const client = await getCanvasClient(userId);
+  if (!client) return [];
+
+  const results = [];
+  let nextUrl = `${client.baseUrl}${endpoint}`;
+  let pages = 0;
+
+  while (nextUrl && pages < maxPages) {
+    try {
+      const res = await fetch(nextUrl, {
+        headers: { Authorization: `Bearer ${client.token}` },
+      });
+      if (!res.ok) {
+        console.error(`Canvas API error ${res.status} for ${nextUrl}`);
+        break;
+      }
+      const data = await res.json();
+      if (!Array.isArray(data)) break;
+      results.push(...data);
+      // Parse Link header: <url>; rel="next"
+      const link = res.headers.get('Link') || '';
+      nextUrl = link.match(/<([^>]+)>;\s*rel="next"/)?.[1] || null;
+      pages++;
+    } catch (err) {
+      console.error('canvasFetchAll error:', err.message || err);
+      break;
+    }
+  }
+
+  return results;
+}
+
 // ─── Enrolled courses (shared dependency) ─────────────────────────────────────
 
 async function getEnrolledCourses(userId) {
@@ -37,13 +75,25 @@ async function getEnrolledCourses(userId) {
   const cached = cache.get(cacheKey);
   if (cached) return cached;
 
-  const data = await canvasFetch(
+  const courses = await canvasFetchAll(
     userId,
-    '/api/v1/courses?enrollment_type=student&enrollment_state=active&per_page=50'
+    '/api/v1/courses?enrollment_type=student&enrollment_state=active&per_page=100'
   );
-  const courses = Array.isArray(data) ? data : [];
   cache.set(cacheKey, courses, 60);
   return courses;
+}
+
+// ─── Course ID → name map ─────────────────────────────────────────────────────
+
+async function getCourseNameMap(userId) {
+  const courses = await getEnrolledCourses(userId);
+  const map = new Map();
+  for (const c of courses) {
+    map.set(String(c.id), c.name || c.course_code || String(c.id));
+    // Also map "course_XXXX" format used in context_codes
+    map.set(`course_${c.id}`, c.name || c.course_code || String(c.id));
+  }
+  return map;
 }
 
 // ─── Upcoming assignments ─────────────────────────────────────────────────────
@@ -59,25 +109,29 @@ async function getUpcomingAssignments(userId, daysAhead = 7) {
   const startDate = today.toISOString().split('T')[0];
   const endDate = end.toISOString().split('T')[0];
 
-  const data = await canvasFetch(
-    userId,
-    `/api/v1/calendar_events?type=assignment&start_date=${startDate}&end_date=${endDate}&per_page=50`
-  );
+  const [data, courseMap] = await Promise.all([
+    canvasFetchAll(userId, `/api/v1/calendar_events?type=assignment&start_date=${startDate}&end_date=${endDate}&per_page=50`),
+    getCourseNameMap(userId),
+  ]);
 
-  if (!data) {
+  if (!data.length && !courseMap.size) {
     cache.set(cacheKey, [], 15);
     return [];
   }
 
   const results = data
     .filter(e => e.start_at)
-    .map(e => ({
-      title: e.title,
-      dueDate: e.start_at,
-      courseName: e.context_code || '',
-      pointsPossible: e.assignment?.points_possible ?? null,
-      htmlUrl: e.html_url,
-    }))
+    .map(e => {
+      const rawCourse = e.context_code || '';
+      const courseName = courseMap.get(rawCourse) || rawCourse;
+      return {
+        title: e.title,
+        dueDate: e.start_at,
+        courseName,
+        pointsPossible: e.assignment?.points_possible ?? null,
+        htmlUrl: e.html_url,
+      };
+    })
     .sort((a, b) => new Date(a.dueDate) - new Date(b.dueDate));
 
   cache.set(cacheKey, results, 15);
@@ -91,40 +145,48 @@ async function getMissingAssignments(userId) {
   const cached = cache.get(cacheKey);
   if (cached) return cached;
 
-  const data = await canvasFetch(
-    userId,
-    '/api/v1/users/self/missing_submissions?include[]=planner_overrides&filter[]=submittable&per_page=20'
-  );
+  const [data, courseMap] = await Promise.all([
+    canvasFetchAll(userId, '/api/v1/users/self/missing_submissions?include[]=planner_overrides&filter[]=submittable&per_page=50'),
+    getCourseNameMap(userId),
+  ]);
 
-  if (!data) {
+  if (!data.length) {
     cache.set(cacheKey, [], 15);
     return [];
   }
 
-  const results = data.map(a => ({
-    title: a.name,
-    dueDate: a.due_at,
-    courseName: String(a.course_id || ''),
-    pointsPossible: a.points_possible ?? null,
-  }));
+  const results = data.map(a => {
+    const courseId = String(a.course_id || '');
+    const courseName = courseMap.get(courseId) || courseMap.get(`course_${courseId}`) || courseId;
+    return {
+      title: a.name,
+      dueDate: a.due_at,
+      courseName,
+      pointsPossible: a.points_possible ?? null,
+    };
+  });
 
   cache.set(cacheKey, results, 15);
   return results;
 }
 
 // ─── Course grades ────────────────────────────────────────────────────────────
+// Reuses getEnrolledCourses (which already caches the course list) and fetches
+// scores via a separate include rather than making a duplicate courses call.
 
 async function getCourseGrades(userId) {
   const cacheKey = `canvas:grades:${userId}`;
   const cached = cache.get(cacheKey);
   if (cached) return cached;
 
-  const data = await canvasFetch(
+  // Fetch with total_scores included — uses a separate endpoint to avoid
+  // invalidating the plain courses cache
+  const data = await canvasFetchAll(
     userId,
-    '/api/v1/courses?enrollment_type=student&enrollment_state=active&include[]=total_scores&per_page=50'
+    '/api/v1/courses?enrollment_type=student&enrollment_state=active&include[]=total_scores&per_page=100'
   );
 
-  if (!data) {
+  if (!data.length) {
     cache.set(cacheKey, [], 15);
     return [];
   }
@@ -134,11 +196,58 @@ async function getCourseGrades(userId) {
     .map(c => {
       const e = c.enrollments[0];
       return {
-        courseName: c.name,
+        courseId: String(c.id),
+        courseName: c.name || c.course_code || String(c.id),
         currentGrade: e.computed_current_grade || null,
         currentScore: e.computed_current_score ?? null,
       };
     });
+
+  cache.set(cacheKey, results, 15);
+  return results;
+}
+
+// ─── Submitted but ungraded assignments ───────────────────────────────────────
+// Returns assignments the student submitted that haven't been graded yet.
+// Useful for "waiting on feedback" context in morning briefs.
+
+async function getSubmittedUngraded(userId) {
+  const cacheKey = `canvas:submitted:${userId}`;
+  const cached = cache.get(cacheKey);
+  if (cached) return cached;
+
+  const courses = await getEnrolledCourses(userId);
+  if (!courses || courses.length === 0) {
+    cache.set(cacheKey, [], 15);
+    return [];
+  }
+
+  const results = [];
+  await Promise.allSettled(
+    courses.map(async course => {
+      const data = await canvasFetchAll(
+        userId,
+        `/api/v1/courses/${course.id}/assignments?include[]=submission&per_page=50`
+      );
+      if (!Array.isArray(data)) return;
+      for (const a of data) {
+        const sub = a.submission;
+        if (
+          sub &&
+          sub.workflow_state === 'submitted' &&
+          (sub.score == null) &&
+          a.grading_type !== 'not_graded'
+        ) {
+          results.push({
+            title: a.name,
+            courseId: String(course.id),
+            courseName: course.name || course.course_code || String(course.id),
+            submittedAt: sub.submitted_at,
+          });
+        }
+      }
+    })
+  );
 
   cache.set(cacheKey, results, 15);
   return results;
@@ -162,12 +271,12 @@ async function getRecentAnnouncements(userId, daysBack = 1) {
   }
 
   const contextParams = courses.map(c => `context_codes[]=course_${c.id}`).join('&');
-  const data = await canvasFetch(
+  const data = await canvasFetchAll(
     userId,
-    `/api/v1/announcements?${contextParams}&start_date=${startDate}&per_page=10`
+    `/api/v1/announcements?${contextParams}&start_date=${startDate}&per_page=50`
   );
 
-  if (!data) {
+  if (!data.length) {
     cache.set(cacheKey, [], 15);
     return [];
   }
@@ -239,10 +348,13 @@ async function detectGradeChanges(userId, currentGrades) {
 module.exports = {
   getCanvasClient,
   canvasFetch,
+  canvasFetchAll,
   getEnrolledCourses,
+  getCourseNameMap,
   getUpcomingAssignments,
   getMissingAssignments,
   getCourseGrades,
+  getSubmittedUngraded,
   getRecentAnnouncements,
   getWeeklySnapshot,
   detectGradeChanges,

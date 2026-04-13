@@ -11,6 +11,7 @@ jest.mock('../src/integrations/outlook');
 jest.mock('../src/integrations/gmail');
 jest.mock('../src/integrations/spotify');
 jest.mock('../src/integrations/weather');
+jest.mock('../src/utils/academicCalendar');
 
 describe('proactive', () => {
   let proactive, db, sms, claude, schedule, canvas, outlook, spotify, weather;
@@ -27,6 +28,7 @@ describe('proactive', () => {
     jest.mock('../src/integrations/gmail');
     jest.mock('../src/integrations/spotify');
     jest.mock('../src/integrations/weather');
+    jest.mock('../src/utils/academicCalendar');
 
     db       = require('../src/db');
     sms      = require('../src/sms');
@@ -41,6 +43,7 @@ describe('proactive', () => {
     db.hasSentProactiveTriggerToday.mockResolvedValue(false);
     db.getProactiveCountToday.mockResolvedValue(0);
     db.getPreference.mockResolvedValue(null);
+    db.query.mockResolvedValue({ rows: [] });
     db.logSentMessage.mockResolvedValue(undefined);
     db.getUserById.mockResolvedValue({ id: 1, phone_number: '+15405550001', name: 'Alex', health_enabled: true });
     db.getAllActiveUsers.mockResolvedValue([]);
@@ -52,6 +55,14 @@ describe('proactive', () => {
     db.getLastUserMessageTime.mockResolvedValue(null);
     db.getLatestHealthReading.mockResolvedValue(null);
     db.getRecentHealthReadings.mockResolvedValue([]);
+
+    const gmail = require('../src/integrations/gmail');
+    gmail.getGoogleCalendarEvents.mockResolvedValue([]);
+
+    canvas.getUpcomingAssignments.mockResolvedValue([]);
+
+    const academicCalendar = require('../src/utils/academicCalendar');
+    academicCalendar.isOnBreak.mockReturnValue(false);
 
     schedule.isInClass.mockResolvedValue(false);
     schedule.getFreeBlocksToday.mockResolvedValue([]);

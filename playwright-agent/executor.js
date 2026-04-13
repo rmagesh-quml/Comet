@@ -1,6 +1,6 @@
 'use strict';
 
-const { healStep } = require('./planner');
+const { healStep, healStepWithVision } = require('./planner');
 
 // ─── SSRF guard ───────────────────────────────────────────────────────────────
 
@@ -187,6 +187,48 @@ async function handleScroll(step, page) {
   );
 }
 
+async function handleUploadFile(step, page, frameCtx) {
+  const frame = getFrame(page, frameCtx);
+  await frame.locator(step.selector).setInputFiles(step.path, { timeout: 10_000 });
+}
+
+// ─── Post-step validation ─────────────────────────────────────────────────────
+// Optional field on any step: "expect": "url_change" | "selector_visible:<sel>" | "text_present:<text>"
+// Returns true if the expectation passes, throws if it fails.
+
+async function validateExpect(step, page, prevUrl) {
+  const { expect: exp } = step;
+  if (!exp) return true;
+
+  if (exp === 'url_change') {
+    const newUrl = page.url();
+    if (newUrl === prevUrl) throw new Error(`expect url_change: URL did not change (still ${prevUrl})`);
+    return true;
+  }
+
+  if (exp.startsWith('selector_visible:')) {
+    const sel = exp.slice('selector_visible:'.length);
+    try {
+      await page.waitForSelector(sel, { state: 'visible', timeout: 5_000 });
+    } catch {
+      throw new Error(`expect selector_visible: "${sel}" not visible after step`);
+    }
+    return true;
+  }
+
+  if (exp.startsWith('text_present:')) {
+    const text = exp.slice('text_present:'.length);
+    try {
+      await page.waitForSelector(`:has-text("${text.replace(/"/g, '\\"')}")`, { timeout: 5_000 });
+    } catch {
+      throw new Error(`expect text_present: "${text}" not found after step`);
+    }
+    return true;
+  }
+
+  return true; // unknown expect values pass silently
+}
+
 // ─── Step dispatcher ──────────────────────────────────────────────────────────
 // frameCtx: current frame (null = main page). Some handlers update it.
 // Returns { frameCtx, result?, screenshot? }.
@@ -217,6 +259,7 @@ async function dispatchStep(step, page, results, screenshots, frameCtx) {
       return newFrame;
     }
     case 'mainFrame':        return null; // reset to main page
+    case 'uploadFile':       await handleUploadFile(step, page, frameCtx); return frameCtx;
     case 'wait':             await handleWait(step); return frameCtx;
     case 'screenshot':       screenshots.push(await handleScreenshot(page)); return frameCtx;
     default:
@@ -226,46 +269,87 @@ async function dispatchStep(step, page, results, screenshots, frameCtx) {
 }
 
 // ─── Plan executor with per-step self-healing ─────────────────────────────────
-// Healing strategy:
-//   1. Snapshot current ARIA tree + capture current URL for context
-//   2. Ask Claude Haiku for a corrected replacement step
-//   3. Retry once — if that also fails, propagate the original error
+// Healing strategy (two-tier):
+//   Tier 1: ARIA-based heal — ask Haiku with full task history + ARIA tree
+//   Tier 2: Visual heal   — if tier 1 also fails, send a screenshot to Haiku vision
+//
+// completedSteps accumulates { action, params, outcome } for healer context.
 
 const HEALABLE_ACTIONS = new Set([
   'click', 'type', 'scrape', 'scrapeAll', 'extractTable', 'select',
   'hover', 'scrollToElement', 'waitForSelector', 'waitForText', 'key',
-  'evaluate',
+  'evaluate', 'uploadFile',
 ]);
 
 async function executePlan(steps, page) {
   const results = [];
   const screenshots = [];
-  let frameCtx = null; // current frame context (null = main page)
+  const completedSteps = []; // task history for healer context
+  let frameCtx = null;
 
   for (const step of steps) {
     if (!step || typeof step.action !== 'string') continue;
 
+    const prevUrl = page.url().catch(() => '');
+
     try {
       frameCtx = await dispatchStep(step, page, results, screenshots, frameCtx);
+
+      // Post-step validation (opt-in via "expect" field on the step)
+      if (step.expect) {
+        const url = await prevUrl;
+        await validateExpect(step, page, url);
+      }
+
+      completedSteps.push({
+        action: step.action,
+        params: { selector: step.selector, url: step.url, text: step.text },
+        outcome: 'ok',
+      });
+
     } catch (originalErr) {
       if (!HEALABLE_ACTIONS.has(step.action)) throw originalErr;
 
-      console.warn(`[executor] step failed, attempting heal: ${step.action} — ${originalErr.message}`);
+      console.warn(`[executor] step failed, attempting ARIA heal: ${step.action} — ${originalErr.message}`);
 
       const [ariaSnapshot, currentUrl] = await Promise.all([
         getAriaSnapshot(page),
         page.url().catch(() => ''),
       ]);
 
-      const healed = await healStep(step, originalErr.message, ariaSnapshot, currentUrl);
+      // Tier 1: ARIA-based heal with full task history
+      const healed = await healStep(step, originalErr.message, ariaSnapshot, currentUrl, completedSteps);
 
-      if (!healed) {
-        console.warn('[executor] healer returned nothing, propagating original error');
-        throw originalErr;
+      if (healed) {
+        try {
+          console.log(`[executor] retrying with healed step: ${JSON.stringify(healed)}`);
+          frameCtx = await dispatchStep(healed, page, results, screenshots, frameCtx);
+          completedSteps.push({ action: healed.action, params: healed, outcome: 'healed' });
+          continue;
+        } catch (healErr) {
+          console.warn(`[executor] healed step also failed: ${healErr.message} — trying visual heal`);
+
+          // Tier 2: Visual fallback — take screenshot, send to vision model
+          try {
+            const screenshotBuf = await page.screenshot({ type: 'jpeg', quality: 60 });
+            const b64 = screenshotBuf.toString('base64');
+            const { healStepWithVision: healVision } = require('./planner');
+            const visualHealed = await healVision(step, originalErr.message, b64, currentUrl);
+            if (visualHealed) {
+              console.log(`[executor] retrying with visually healed step: ${JSON.stringify(visualHealed)}`);
+              frameCtx = await dispatchStep(visualHealed, page, results, screenshots, frameCtx);
+              completedSteps.push({ action: visualHealed.action, params: visualHealed, outcome: 'visual-healed' });
+              continue;
+            }
+          } catch (visualErr) {
+            console.warn(`[executor] visual heal also failed: ${visualErr.message}`);
+          }
+        }
       }
 
-      console.log(`[executor] retrying with healed step: ${JSON.stringify(healed)}`);
-      frameCtx = await dispatchStep(healed, page, results, screenshots, frameCtx);
+      // All healing exhausted — propagate original error
+      console.warn('[executor] all healing failed, propagating original error');
+      throw originalErr;
     }
   }
 

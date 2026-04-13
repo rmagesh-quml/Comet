@@ -82,12 +82,12 @@ describe('styleAnalyzer', () => {
       expect(result).toBeNull();
     });
 
-    it('caches valid result for 7 days (10080 minutes)', async () => {
+    it('caches valid result for 3 days (4320 minutes)', async () => {
       await styleAnalyzer.analyzeUserStyle(1);
       expect(cache.set).toHaveBeenCalledWith(
         'style:1',
         expect.objectContaining({ casing: 'lowercase' }),
-        10080
+        4320
       );
     });
 

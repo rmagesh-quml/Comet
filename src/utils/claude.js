@@ -87,4 +87,9 @@ async function classify(prompt, maxTokens = 200, taskType = 'classification') {
   }
 }
 
-module.exports = { generateUserMessage, classify };
+// Expose raw client for agent loops that need tool use
+function getAnthropicClient() {
+  return getClient();
+}
+
+module.exports = { generateUserMessage, classify, getAnthropicClient };

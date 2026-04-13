@@ -38,6 +38,7 @@ const webhookLimiter = rateLimit({
   max: 60,
   standardHeaders: true,
   legacyHeaders: false,
+  validate: false,
   keyGenerator: (req) => req.body?.data?.from || req.ip,
   skip: () => process.env.NODE_ENV === 'test',
 });
@@ -45,6 +46,7 @@ const webhookLimiter = rateLimit({
 const strictLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 10,
+  validate: false,
   keyGenerator: (req) => req.ip,
   skip: () => process.env.NODE_ENV === 'test',
 });
@@ -52,6 +54,7 @@ const strictLimiter = rateLimit({
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
+  validate: false,
   keyGenerator: (req) => req.ip,
   skip: () => process.env.NODE_ENV === 'test',
 });
@@ -436,7 +439,7 @@ async function startup() {
       .catch(e => console.error('Telegram webhook registration failed:', e.message || e));
   }
 
-  scheduleAllJobs();
+  await scheduleAllJobs();
   console.log('scheduler running');
 
   app.listen(PORT, () => {

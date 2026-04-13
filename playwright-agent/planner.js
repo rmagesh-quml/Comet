@@ -23,6 +23,7 @@ const ACTION_SHAPES = `\
 { "action": "waitForResponse", "urlPattern": string, "timeout"?: number }
 { "action": "switchFrame", "selector": string }
 { "action": "mainFrame" }
+{ "action": "uploadFile", "selector": string, "path": string }
 { "action": "wait", "ms": number }
 { "action": "screenshot" }`;
 
@@ -31,11 +32,29 @@ const PLANNING_SYSTEM = `You are a browser automation planner for complex multi-
 Each step must be one of these exact shapes:
 ${ACTION_SHAPES}
 
-## Selector guidance (priority order)
-1. When an ARIA tree is provided, use role/name selectors: button[name="Submit"], heading[name="Login"]
-2. Prefer text-content selectors: text="Sign in", :has-text("Continue")
-3. Use aria-label or data-testid attributes when visible in the ARIA tree
-4. Fall back to CSS only when no semantic selector exists
+## Selector priority (CRITICAL — follow this order strictly)
+Selectors that survive DOM refactors are always preferred over CSS paths:
+
+1. **Role + name** (most resilient): Use ARIA role selectors matching the accessibility tree.
+   Examples: \`button[name="Submit"]\`, \`[role="button"][aria-label="Sign in"]\`, \`heading[name="Login"]\`
+
+2. **Visible text**: Match by text content visible in the ARIA tree.
+   Examples: \`text="Sign in"\`, \`:has-text("Continue")\`, \`[aria-label*="Submit" i]\`
+
+3. **Form labels**: Match inputs by their associated label text.
+   Examples: \`label="Email address"\`, \`[placeholder="Search..."]\`
+
+4. **Test IDs / stable IDs**: Use \`data-testid\`, \`data-cy\`, or \`id\` attributes when present.
+   Examples: \`[data-testid="submit-btn"]\`, \`#email-input\`
+
+5. **CSS path (LAST RESORT)**: Only when none of the above apply.
+   Examples: \`.form-container button.primary\`  ← avoid if any semantic option exists
+
+When reading the ARIA tree snapshot, map element names and roles directly to selectors.
+
+## File uploads
+- Use the uploadFile action with the CSS selector for \`<input type="file">\` and the absolute file path
+- Example: \`{ "action": "uploadFile", "selector": "input[type='file']", "path": "/tmp/document.pdf" }\`
 
 ## Navigation and loading
 - After navigate or any click that triggers a page load: insert waitForNavigation or waitForSelector before next interaction
@@ -127,17 +146,26 @@ async function planTask(description, context, ariaSnapshot = null) {
 // Returns a single replacement step, or null if healing fails.
 // Uses Haiku — fast and cheap, called only on failure.
 
-async function healStep(failedStep, errorMessage, ariaSnapshot, currentUrl = '') {
+// completedSteps: array of { action, selector?, text?, outcome } for the last N steps
+async function healStep(failedStep, errorMessage, ariaSnapshot, currentUrl = '', completedSteps = []) {
   const snap = ariaSnapshot
     ? truncateAria(ariaSnapshot, 3000)
     : '(not available)';
 
   const urlContext = currentUrl ? `\nCurrent page URL: ${currentUrl}` : '';
 
+  const historyContext = completedSteps.length > 0
+    ? `\nRecent steps completed successfully:\n${
+        completedSteps.slice(-5).map((s, i) =>
+          `${i + 1}. ${s.action}(${JSON.stringify(s.params || {}).slice(0, 80)}) → ${s.outcome || 'ok'}`
+        ).join('\n')
+      }\n`
+    : '';
+
   const prompt = `A browser automation step failed. Return ONLY a single corrected JSON step object.
 
 Failed step: ${JSON.stringify(failedStep)}
-Error: ${errorMessage}${urlContext}
+Error: ${errorMessage}${urlContext}${historyContext}
 
 Current page ARIA tree:
 ${snap}
@@ -145,6 +173,7 @@ ${snap}
 Available action shapes:
 ${ACTION_SHAPES}
 
+Selector priority: role+name selectors > text selectors > label selectors > id/testid > CSS.
 Return a single JSON object. No array, no explanation.`;
 
   try {
@@ -167,4 +196,48 @@ Return a single JSON object. No array, no explanation.`;
   }
 }
 
-module.exports = { planTask, healStep, ACTION_SHAPES, truncateAria };
+// ─── Visual healer ─────────────────────────────────────────────────────────────
+// Second-chance healer: sends a screenshot + context to Claude vision when
+// ARIA-based healing fails. More expensive but catches layout issues invisible
+// in the accessibility tree.
+
+async function healStepWithVision(failedStep, errorMessage, screenshotBase64, currentUrl = '') {
+  if (!screenshotBase64) return null;
+  const urlContext = currentUrl ? `\nCurrent page URL: ${currentUrl}` : '';
+  const prompt = `A browser automation step failed twice. Looking at the screenshot, return ONLY a single corrected JSON step.
+
+Failed step: ${JSON.stringify(failedStep)}
+Error: ${errorMessage}${urlContext}
+
+Available action shapes:
+${ACTION_SHAPES}
+
+Return a single JSON object. No array, no explanation.`;
+
+  try {
+    const response = await getClient().messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 300,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: screenshotBase64 } },
+          { type: 'text', text: prompt },
+        ],
+      }],
+    });
+
+    const raw = response.content[0].text.trim()
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```$/, '')
+      .trim();
+
+    const step = JSON.parse(raw);
+    if (!step || typeof step.action !== 'string') return null;
+    return step;
+  } catch {
+    return null;
+  }
+}
+
+module.exports = { planTask, healStep, healStepWithVision, ACTION_SHAPES, truncateAria };

@@ -3,10 +3,10 @@
 require('dotenv').config();
 
 const express = require('express');
-const { launch, newContext, newPage, closeContext, closeBrowser } = require('./browser');
+const { launch, newContext, newPage, closeContext, closeBrowser, validateChromium } = require('./browser');
 const { planTask } = require('./planner');
 const { executePlan, getAriaSnapshot, isSsrfTarget } = require('./executor');
-const { ensureTable, hostnameFromUrl, loadSession, saveSession, clearSession, listSessions } = require('./sessions');
+const { ensureTable, hostnameFromUrl, loadSession, saveSession, clearSession, listSessions, validateSession } = require('./sessions');
 const {
   createTask,
   getTask,
@@ -22,6 +22,36 @@ const {
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// ─── Simple in-memory rate limiter for POST /tasks ────────────────────────────
+// 10 task requests per IP per minute. Resets on a rolling window.
+
+const taskRateCounts = new Map(); // ip → { count, resetAt }
+const TASKS_RATE_LIMIT = 10;
+const TASKS_RATE_WINDOW_MS = 60 * 1000;
+
+function tasksRateLimiter(req, res, next) {
+  const ip = req.ip || 'unknown';
+  const now = Date.now();
+  const entry = taskRateCounts.get(ip);
+  if (!entry || now >= entry.resetAt) {
+    taskRateCounts.set(ip, { count: 1, resetAt: now + TASKS_RATE_WINDOW_MS });
+    return next();
+  }
+  if (entry.count >= TASKS_RATE_LIMIT) {
+    return res.status(429).json({ error: 'Too many task requests — try again in a minute' });
+  }
+  entry.count++;
+  next();
+}
+
+// Clean up stale rate limit entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of taskRateCounts) {
+    if (now >= entry.resetAt) taskRateCounts.delete(ip);
+  }
+}, 5 * 60 * 1000);
 
 // Default 4 min; tasks may request up to 10 min via timeoutMs body field.
 const DEFAULT_TIMEOUT_MS = Number(process.env.DEFAULT_TASK_TIMEOUT_MS) || 240_000;
@@ -99,6 +129,20 @@ async function runTask(taskId) {
 
     // ── Phase 1: create context + page ───────────────────────────────────────
     context = await newContext(storageState);
+
+    // ── Phase 1b: validate loaded session (if any) ───────────────────────────
+    if (storageState && sessionHostname) {
+      const { valid, reason } = await validateSession(context, sessionHostname);
+      if (!valid) {
+        console.warn(`[runTask] session invalid for ${sessionHostname} (${reason}) — discarding and retrying fresh`);
+        await clearSession(task.userId, sessionHostname);
+        await closeContext(context);
+        context = await newContext(null); // fresh context, no stale cookies
+        storageState = null;
+        updateTask(taskId, { sessionLoaded: false });
+      }
+    }
+
     page = await newPage(context);
 
     // ── Phase 2: pre-navigate if the description contains a URL ──────────────
@@ -189,7 +233,7 @@ function scheduleTask(taskId) {
 
 // ─── POST /tasks ──────────────────────────────────────────────────────────────
 
-app.post('/tasks', requireAuth, (req, res) => {
+app.post('/tasks', requireAuth, tasksRateLimiter, (req, res) => {
   const { taskId, description, context, userId, timeoutMs } = req.body ?? {};
 
   if (!taskId || typeof taskId !== 'string') {
@@ -274,6 +318,7 @@ app.delete('/sessions/:userId', requireAuth, async (req, res) => {
 // ─── Startup ──────────────────────────────────────────────────────────────────
 
 async function startup() {
+  validateChromium(); // fails fast if binary missing — clear error before port opens
   await ensureTable();
   await launch();
 

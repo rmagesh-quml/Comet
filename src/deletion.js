@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const db = require('./db');
 const { sendMessage } = require('./sms');
 const { deleteUserMemories } = require('./memory/store');
@@ -10,7 +11,8 @@ async function requestDeletion(userId) {
   const user = await db.getUserById(userId);
   if (!user) return;
 
-  const code = String(Math.floor(100000 + Math.random() * 900000));
+  // Cryptographically strong 6-digit code (not Math.random which is predictable)
+  const code = String((crypto.randomBytes(4).readUInt32BE() % 900000) + 100000);
   await db.setDeletionCode(userId, code);
 
   await sendMessage(
@@ -23,6 +25,14 @@ async function requestDeletion(userId) {
 // ─── Confirm deletion ─────────────────────────────────────────────────────────
 
 async function confirmDeletion(userId, code, { userCrons, cancelGraphSubscription } = {}) {
+  // Brute-force protection: increment attempt counter before verifying
+  const attempts = await db.incrementDeletionAttempts(userId);
+  if (attempts > 5) {
+    // Too many wrong attempts — invalidate the code so they have to request a new one
+    await db.clearDeletionCode(userId);
+    return false;
+  }
+
   const valid = await db.verifyDeletionCode(userId, code);
   if (!valid) return false;
 

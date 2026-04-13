@@ -9,6 +9,12 @@ jest.mock('../src/memory/store');
 jest.mock('../src/learning/styleAnalyzer');
 jest.mock('../src/learning/feedbackCapture');
 jest.mock('../src/deletion');
+jest.mock('../src/integrations/canvas');
+jest.mock('../src/integrations/outlook');
+jest.mock('../src/integrations/gmail');
+jest.mock('../src/integrations/weather');
+jest.mock('../src/integrations/schedule');
+jest.mock('../src/utils/academicCalendar');
 
 describe('brain', () => {
   let brain;
@@ -25,16 +31,51 @@ describe('brain', () => {
     jest.mock('../src/learning/styleAnalyzer');
     jest.mock('../src/learning/feedbackCapture');
     jest.mock('../src/deletion');
+    jest.mock('../src/integrations/canvas');
+    jest.mock('../src/integrations/outlook');
+    jest.mock('../src/integrations/gmail');
+    jest.mock('../src/integrations/weather');
+    jest.mock('../src/integrations/schedule');
+    jest.mock('../src/utils/academicCalendar');
 
     db = require('../src/db');
     sms = require('../src/sms');
     claude = require('../src/utils/claude');
+
+    // Mock Anthropic client used in runAgentLoop
+    const mockMessagesCreate = jest.fn().mockResolvedValue({
+      content: [{ type: 'text', text: 'hey what is up' }],
+      stop_reason: 'end_turn',
+    });
+    claude.getAnthropicClient.mockReturnValue({
+      messages: { create: mockMessagesCreate },
+    });
+
+    // Mock new integration imports in brain.js
+    const canvas = require('../src/integrations/canvas');
+    canvas.getWeeklySnapshot.mockResolvedValue({ upcoming: [], missing: [], grades: [], announcements: [] });
+    const outlook = require('../src/integrations/outlook');
+    outlook.getTodaysEvents.mockResolvedValue([]);
+    outlook.getUpcomingEvents.mockResolvedValue([]);
+    const gmail = require('../src/integrations/gmail');
+    gmail.getAllEmailContext.mockResolvedValue({ school: [], personal: [] });
+    gmail.getGoogleCalendarEvents.mockResolvedValue([]);
+    const weather = require('../src/integrations/weather');
+    weather.getTodaysForecast.mockResolvedValue(null);
+    const schedule = require('../src/integrations/schedule');
+    schedule.getClassSchedule.mockResolvedValue([]);
+    const academicCalendar = require('../src/utils/academicCalendar');
+    academicCalendar.daysUntilExams.mockReturnValue(null);
+    academicCalendar.isFinalsWeek.mockReturnValue(false);
+    academicCalendar.getCurrentSemesterWeek.mockReturnValue(null);
+    academicCalendar.isOnBreak.mockReturnValue(false);
 
     const store = require('../src/memory/store');
     store.searchMemories.mockResolvedValue([]);
 
     const styleAnalyzer = require('../src/learning/styleAnalyzer');
     styleAnalyzer.getStyleContext.mockResolvedValue('');
+    styleAnalyzer.getResponseFormatHint = jest.fn().mockResolvedValue(null);
 
     const feedbackCapture = require('../src/learning/feedbackCapture');
     feedbackCapture.captureConversationFeedback.mockResolvedValue(undefined);

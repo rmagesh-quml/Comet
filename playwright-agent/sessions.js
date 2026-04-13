@@ -126,4 +126,24 @@ async function listSessions(userId) {
   }
 }
 
-module.exports = { ensureTable, hostnameFromUrl, loadSession, saveSession, clearSession, listSessions };
+// Validate that a loaded session is still authenticated by navigating to the
+// hostname root and checking for login page redirects. Returns { valid, reason? }.
+// Call before executing a task with a loaded session; if invalid, clear it and
+// let the planner handle a fresh login.
+async function validateSession(context, hostname) {
+  const page = await context.newPage();
+  try {
+    await page.goto(`https://${hostname}`, { waitUntil: 'domcontentloaded', timeout: 8_000 });
+    const url = page.url();
+    if (/\/(login|signin|auth|logout)/i.test(new URL(url).pathname)) {
+      return { valid: false, reason: 'redirected_to_login' };
+    }
+    return { valid: true };
+  } catch {
+    return { valid: false, reason: 'navigation_failed' };
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+module.exports = { ensureTable, hostnameFromUrl, loadSession, saveSession, clearSession, listSessions, validateSession };

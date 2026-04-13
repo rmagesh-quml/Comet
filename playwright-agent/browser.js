@@ -1,5 +1,6 @@
 'use strict';
 
+const fs = require('fs');
 const { chromium } = require('playwright');
 
 // ─── Singleton browser instance ───────────────────────────────────────────────
@@ -75,4 +76,19 @@ async function closeBrowser() {
   }
 }
 
-module.exports = { launch, newContext, newPage, closeContext, closeBrowser };
+// ─── Startup validation ───────────────────────────────────────────────────────
+// Call this at process startup to fail fast if Chromium isn't where we expect.
+
+function validateChromium() {
+  const chromiumPath =
+    process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || '/usr/bin/chromium-browser';
+  if (!fs.existsSync(chromiumPath)) {
+    throw new Error(
+      `Chromium binary not found at: ${chromiumPath}. ` +
+      `Set PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH or install Chromium.`
+    );
+  }
+  console.log(`Playwright: Chromium validated at ${chromiumPath}`);
+}
+
+module.exports = { launch, newContext, newPage, closeContext, closeBrowser, validateChromium };

@@ -2,7 +2,7 @@
 
 const { classify } = require('../utils/claude');
 const { storeMemory } = require('../memory/store');
-const { updatePreference } = require('../db');
+const { updatePreference, query: dbQuery } = require('../db');
 
 const CORRECTION_PHRASES = [
   'no that', 'not really', 'actually',
@@ -27,6 +27,12 @@ const DISENGAGEMENT_SIGNALS = [
   'ok', 'okay', 'k', 'sure', 'whatever',
   'fine', 'noted', 'got it', 'ok cool',
   'kk', 'yep', 'yup',
+];
+
+const FORMAT_BREVITY_REQUESTS = [
+  'keep it short', 'shorter', 'tldr', 'tl;dr', 'too long',
+  'shorter please', 'be brief', 'in short', 'summarize',
+  'just the basics', 'just tell me', 'quick version',
 ];
 
 async function captureConversationFeedback(userId, userMessage, previousAgentMessage) {
@@ -68,17 +74,19 @@ async function captureConversationFeedback(userId, userMessage, previousAgentMes
     }
   } catch { /* silent */ }
 
-  // CHECK 4 — Disengagement signal
+  // CHECK 4 — Disengagement signal (raised threshold to 200 chars to reduce false positives)
   try {
     const isOnlyDisengagement =
       DISENGAGEMENT_SIGNALS.includes(userMessage.trim().toLowerCase()) &&
-      previousAgentMessage.length > 100;
+      previousAgentMessage.length > 200;
     if (isOnlyDisengagement) {
       await storeMemory(
         userId,
         'user gave dismissive reply to a long message — keep it shorter and more casual',
         { type: 'preference', importance: 6, source: 'feedback_capture' }
       );
+      // Also record a negative format signal
+      await updatePreference(userId, 'response_format', 'format', false);
     }
   } catch { /* silent */ }
 
@@ -103,6 +111,48 @@ async function captureConversationFeedback(userId, userMessage, previousAgentMes
         'user opened up and wrote a lot after a short casual message — short messages get more engagement from this person',
         { type: 'preference', importance: 8, source: 'feedback_capture' }
       );
+      // Positive format signal — short messages work
+      await updatePreference(userId, 'response_format', 'format', true);
+    }
+  } catch { /* silent */ }
+
+  // CHECK 7 — Explicit brevity request
+  try {
+    const lower = userMessage.toLowerCase();
+    if (FORMAT_BREVITY_REQUESTS.some(p => lower.includes(p))) {
+      await storeMemory(
+        userId,
+        `user explicitly asked for shorter responses: "${userMessage.slice(0, 100)}"`,
+        { type: 'preference', importance: 9, source: 'feedback_capture' }
+      );
+      // Strong negative format signal — record 3x to outweigh prior history
+      await updatePreference(userId, 'response_format', 'format', false);
+      await updatePreference(userId, 'response_format', 'format', false);
+      await updatePreference(userId, 'response_format', 'format', false);
+    }
+  } catch { /* silent */ }
+
+  // CHECK 8 — Repeated short replies to long agent messages (tracked across last 3 turns)
+  try {
+    const recentResult = await dbQuery(
+      `SELECT role, content FROM messages
+       WHERE user_id = $1
+       ORDER BY created_at DESC LIMIT 6`,
+      [userId]
+    );
+    const turns = recentResult.rows;
+    // Count alternating pairs where agent > 150 chars and user ≤ 3 words
+    let shortReplyToLongCount = 0;
+    for (let i = 0; i + 1 < turns.length; i++) {
+      const userTurn = turns[i].role === 'user' ? turns[i] : null;
+      const agentTurn = turns[i + 1]?.role === 'assistant' ? turns[i + 1] : null;
+      if (userTurn && agentTurn) {
+        const userWords = userTurn.content.trim().split(/\s+/).length;
+        if (agentTurn.content.length > 150 && userWords <= 3) shortReplyToLongCount++;
+      }
+    }
+    if (shortReplyToLongCount >= 3) {
+      await updatePreference(userId, 'response_format', 'format', false);
     }
   } catch { /* silent */ }
 }

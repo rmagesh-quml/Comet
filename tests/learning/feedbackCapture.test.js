@@ -129,7 +129,7 @@ describe('feedbackCapture', () => {
 
     // CHECK 4 — disengagement
     it('detects "ok" as disengagement to long message', async () => {
-      const longAgent = 'x'.repeat(101);
+      const longAgent = 'x'.repeat(201);
       await feedbackCapture.captureConversationFeedback(1, 'ok', longAgent);
       expect(store.storeMemory).toHaveBeenCalledWith(
         1,
@@ -145,7 +145,7 @@ describe('feedbackCapture', () => {
     });
 
     it('does not flag disengagement for non-disengagement word', async () => {
-      const longAgent = 'x'.repeat(101);
+      const longAgent = 'x'.repeat(201);
       await feedbackCapture.captureConversationFeedback(1, 'thanks a lot!', longAgent);
       const calls = store.storeMemory.mock.calls.filter(c => c[1].includes('dismissive reply'));
       expect(calls.length).toBe(0);

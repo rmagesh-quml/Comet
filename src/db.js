@@ -172,6 +172,21 @@ async function setup() {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS deletion_code_expires_at TIMESTAMP;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_chat_id VARCHAR UNIQUE;
       ALTER TABLE users ALTER COLUMN phone_number DROP NOT NULL;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS deletion_attempts INTEGER DEFAULT 0;
+    `);
+
+    // Local memory fallback table — used when Mem0 cloud is unavailable
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS user_memories (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        text TEXT NOT NULL,
+        type VARCHAR DEFAULT 'preference',
+        importance INTEGER DEFAULT 5,
+        source VARCHAR,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS user_memories_user_id ON user_memories(user_id);
     `);
   } finally {
     client.release();
@@ -771,9 +786,85 @@ async function verifyDeletionCode(userId, code) {
 
 async function clearDeletionCode(userId) {
   await pool.query(
-    'UPDATE users SET deletion_code = NULL, deletion_code_expires_at = NULL WHERE id = $1',
+    'UPDATE users SET deletion_code = NULL, deletion_code_expires_at = NULL, deletion_attempts = 0 WHERE id = $1',
     [userId]
   );
+}
+
+async function incrementDeletionAttempts(userId) {
+  const result = await pool.query(
+    'UPDATE users SET deletion_attempts = deletion_attempts + 1 WHERE id = $1 RETURNING deletion_attempts',
+    [userId]
+  );
+  return result.rows[0]?.deletion_attempts ?? 1;
+}
+
+// ─── Local memory fallback ────────────────────────────────────────────────────
+
+async function saveLocalMemory(userId, text, type = 'preference', importance = 5, source = null) {
+  await pool.query(
+    'INSERT INTO user_memories (user_id, text, type, importance, source) VALUES ($1, $2, $3, $4, $5)',
+    [userId, text, type, importance, source]
+  );
+}
+
+async function searchLocalMemories(userId, limit = 5) {
+  const result = await pool.query(
+    `SELECT * FROM user_memories
+     WHERE user_id = $1
+     ORDER BY importance DESC, created_at DESC
+     LIMIT $2`,
+    [userId, limit]
+  );
+  return result.rows.map(r => ({
+    text: r.text,
+    type: r.type,
+    importance: r.importance,
+    score: r.importance / 10,
+  }));
+}
+
+async function deleteLocalMemories(userId) {
+  await pool.query('DELETE FROM user_memories WHERE user_id = $1', [userId]);
+}
+
+// ─── Preference helpers ───────────────────────────────────────────────────────
+
+async function getPreferenceByType(userId, triggerType) {
+  const result = await pool.query(
+    `SELECT * FROM user_preferences
+     WHERE user_id = $1 AND trigger_type = $2
+     ORDER BY updated_at DESC LIMIT 1`,
+    [userId, triggerType]
+  );
+  return result.rows[0] || null;
+}
+
+// ─── Proactive threading ──────────────────────────────────────────────────────
+// Returns the most recent proactive outbound message sent within the given
+// window, so brain.js can thread user replies back to that context.
+
+async function getRecentProactiveSent(userId, withinMinutes = 120) {
+  const result = await pool.query(
+    `SELECT sm.content, sm.type, sm.created_at
+     FROM sent_messages sm
+     WHERE sm.user_id = $1
+       AND sm.type NOT IN ('outbound')
+       AND sm.type NOT LIKE 'proactive:%'
+       AND sm.content IS NOT NULL AND sm.content <> ''
+       AND sm.created_at >= NOW() - INTERVAL '1 minute' * $2
+     UNION ALL
+     SELECT sm.content, sm.type, sm.created_at
+     FROM sent_messages sm
+     WHERE sm.user_id = $1
+       AND sm.type LIKE 'proactive:%'
+       AND sm.content IS NOT NULL AND sm.content <> ''
+       AND sm.status = 'sent'
+       AND sm.created_at >= NOW() - INTERVAL '1 minute' * $2
+     ORDER BY created_at DESC LIMIT 1`,
+    [userId, withinMinutes]
+  );
+  return result.rows[0] || null;
 }
 
 // ─── Pool close ───────────────────────────────────────────────────────────────
@@ -863,6 +954,15 @@ module.exports = {
   setDeletionCode,
   verifyDeletionCode,
   clearDeletionCode,
+  incrementDeletionAttempts,
+  // Local memory fallback
+  saveLocalMemory,
+  searchLocalMemories,
+  deleteLocalMemories,
+  // Preference helpers
+  getPreferenceByType,
+  // Proactive threading
+  getRecentProactiveSent,
   // Connection
   close,
 };

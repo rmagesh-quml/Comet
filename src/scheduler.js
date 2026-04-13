@@ -126,6 +126,8 @@ const {
   canvasAlert,
   healthNudge,
   nightlyDigest,
+  examCountdown,
+  detectConflicts,
 } = require('./proactive');
 
 function buildCanvasContext(snapshot, gradeChanges) {
@@ -317,69 +319,26 @@ function scheduleUserJobs(user) {
     { timezone: tz }
   ));
 
-  // 10am Canvas alert + health nudge
-  jobs.push(cron.schedule(
-    '0 10 * * *',
-    async () => {
-      try {
-        if (await isInClass(user.id)) return;
-        await canvasAlert(user.id).catch(e =>
-          console.error(`canvasAlert error for user ${user.id}:`, e.message || e)
-        );
-        await healthNudge(user.id).catch(e =>
-          console.error(`healthNudge error for user ${user.id}:`, e.message || e)
-        );
-      } catch (err) {
-        console.error(`10am proactive error for user ${user.id}:`, err.message || err);
-      }
-    },
-    { timezone: tz }
-  ));
-
-  // 9pm nightly digest
-  jobs.push(cron.schedule(
-    '0 21 * * *',
-    async () => {
-      try {
-        if (await isInClass(user.id)) return;
-        await nightlyDigest(user.id).catch(e =>
-          console.error(`nightlyDigest error for user ${user.id}:`, e.message || e)
-        );
-      } catch (err) {
-        console.error(`Nightly digest error for user ${user.id}:`, err.message || err);
-      }
-    },
-    { timezone: tz }
-  ));
-
-  // 2:30am nightly extraction + pattern extraction
-  jobs.push(cron.schedule(
-    '30 2 * * *',
-    async () => {
-      try {
-        await nightlyExtraction(user.id);
-        await extractInteractionPatterns(user.id).catch(e =>
-          console.error(`Pattern extraction error for user ${user.id}:`, e.message || e)
-        );
-      } catch (err) {
-        console.error(`Nightly extraction error for user ${user.id}:`, err.message || err);
-      }
-    },
-    { timezone: tz }
-  ));
+  // NOTE: Canvas alert (10am), nightly digest (9pm), and memory extraction (2:30am)
+  // are handled by single global fan-out crons in scheduleAllJobs() below.
+  // Only brief timing jobs belong here (they require per-user timezone awareness).
 
   userCrons.set(user.id, jobs);
 }
 
-function scheduleAllJobs() {
-  // Bootstrap per-user jobs at startup
-  db.getAllActiveUsers().then(users => {
+async function scheduleAllJobs() {
+  // Bootstrap per-user jobs at startup — awaited so briefs are scheduled
+  // before any other startup code runs
+  try {
+    const users = await db.getAllActiveUsers();
     for (const user of users) {
       scheduleUserJobs(user);
     }
-  }).catch(err => {
+    console.log(`Bootstrapped cron jobs for ${users.length} users`);
+  } catch (err) {
     console.error('Failed to bootstrap per-user cron jobs:', err.message || err);
-  });
+    // Non-fatal: global crons below still register
+  }
 
   // Reset per-user message counts at midnight
   cron.schedule('0 0 * * *', async () => {
@@ -413,9 +372,77 @@ function scheduleAllJobs() {
     }
   });
 
-  // Fetch BT real-time predictions every 30 seconds (overlap guard prevents pile-up)
+  // ─── Global fan-out jobs ────────────────────────────────────────────────────
+  // These replace per-user crons — one job iterates all users instead of N jobs.
+
+  // 10am: Canvas alert + health nudge for all active users
+  cron.schedule('0 10 * * *', async () => {
+    try {
+      const users = await db.getAllActiveUsers();
+      for (const user of users) {
+        canvasAlert(user.id).catch(e =>
+          console.error(`canvasAlert error for user ${user.id}:`, e.message || e)
+        );
+        healthNudge(user.id).catch(e =>
+          console.error(`healthNudge error for user ${user.id}:`, e.message || e)
+        );
+      }
+    } catch (err) {
+      console.error('10am global proactive error:', err.message || err);
+    }
+  });
+
+  // 8:30am: Exam countdown for all active users (fires after morning briefs)
+  cron.schedule('30 8 * * *', async () => {
+    try {
+      const users = await db.getAllActiveUsers();
+      for (const user of users) {
+        examCountdown(user.id).catch(e =>
+          console.error(`examCountdown error for user ${user.id}:`, e.message || e)
+        );
+      }
+    } catch (err) {
+      console.error('Exam countdown cron error:', err.message || err);
+    }
+  });
+
+  // 9pm: Nightly digest for all active users
+  cron.schedule('0 21 * * *', async () => {
+    try {
+      const users = await db.getAllActiveUsers();
+      for (const user of users) {
+        nightlyDigest(user.id).catch(e =>
+          console.error(`nightlyDigest error for user ${user.id}:`, e.message || e)
+        );
+      }
+    } catch (err) {
+      console.error('9pm nightly digest error:', err.message || err);
+    }
+  });
+
+  // 2:30am: Memory extraction + pattern extraction for all active users
+  cron.schedule('30 2 * * *', async () => {
+    try {
+      const users = await db.getAllActiveUsers();
+      for (const user of users) {
+        nightlyExtraction(user.id).catch(e =>
+          console.error(`Nightly extraction error for user ${user.id}:`, e.message || e)
+        );
+        extractInteractionPatterns(user.id).catch(e =>
+          console.error(`Pattern extraction error for user ${user.id}:`, e.message || e)
+        );
+      }
+    } catch (err) {
+      console.error('2:30am extraction error:', err.message || err);
+    }
+  });
+
+  // Fetch BT real-time predictions every 2 minutes (was 30s — 93% reduction in API calls)
+  // Skip between 10pm and 6am when buses aren't running
   let _btFetchRunning = false;
-  cron.schedule('*/30 * * * * *', async () => {
+  cron.schedule('*/2 * * * *', async () => {
+    const hour = new Date().getHours();
+    if (hour < 6 || hour >= 22) return; // buses not running
     if (_btFetchRunning) return;
     _btFetchRunning = true;
     try {
@@ -425,7 +452,7 @@ function scheduleAllJobs() {
     } finally {
       _btFetchRunning = false;
     }
-  }, { scheduled: true });
+  });
 
   // Check for bus departure alerts every 5 minutes
   // Track sent alerts in-memory to avoid duplicates
@@ -493,12 +520,15 @@ function scheduleAllJobs() {
     }
   });
 
-  // Nightly planning at 2am — schedule tomorrow's proactive messages
+  // Nightly planning at 2am — schedule tomorrow's proactive messages + conflict detection
   cron.schedule('0 2 * * *', async () => {
     try {
       const users = await db.getAllActiveUsers();
       for (const user of users) {
         await nightlyPlan(user.id);
+        detectConflicts(user.id).catch(e =>
+          console.error(`detectConflicts error for user ${user.id}:`, e.message || e)
+        );
       }
     } catch (err) {
       console.error('Nightly plan error:', err.message || err);

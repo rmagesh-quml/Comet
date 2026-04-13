@@ -13,10 +13,13 @@ const mockRegisterLinqWebhook = jest.fn().mockResolvedValue(undefined);
 
 jest.mock('../../src/sms', () => ({
   isLinqAvailable: (...args) => mockIsLinqAvailable(...args),
+  isTelegramAvailable: jest.fn().mockReturnValue(false),
   verifyLinqWebhook: (...args) => mockVerifyLinqWebhook(...args),
+  verifyTelegramWebhook: jest.fn((req, res, next) => next()),
   sendMessage: (...args) => mockSendMessage(...args),
   detectAndUpdateMessagingService: (...args) => mockDetectAndUpdateMessagingService(...args),
   registerLinqWebhook: (...args) => mockRegisterLinqWebhook(...args),
+  registerTelegramWebhook: jest.fn().mockResolvedValue(undefined),
 }));
 
 const mockGetResponse = jest.fn().mockResolvedValue('hey there!');
@@ -112,13 +115,14 @@ describe('HTTP integration — webhook routing', () => {
     it('reports provider: twilio when Linq unavailable', async () => {
       mockIsLinqAvailable.mockReturnValue(false);
       const res = await request(app).get('/health');
-      expect(res.body.provider).toBe('twilio');
+      expect(res.body.providers).toContain('twilio');
+      expect(res.body.providers).not.toContain('linq');
     });
 
     it('reports provider: linq when Linq available', async () => {
       mockIsLinqAvailable.mockReturnValue(true);
       const res = await request(app).get('/health');
-      expect(res.body.provider).toBe('linq');
+      expect(res.body.providers).toContain('linq');
     });
   });
 
