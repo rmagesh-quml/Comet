@@ -61,25 +61,50 @@ describe('canvas integration', () => {
     });
 
     it('returns correctly shaped array on success', async () => {
-      const apiResponse = [
+      // planner/items response shape (used since calendar_events?type=assignment
+      // only returns manually-added calendar events, not course assignments)
+      const plannerResponse = [
         {
-          title: 'Homework 1',
-          start_at: '2024-03-15T23:59:00Z',
-          context_code: 'course_101',
-          html_url: 'https://canvas.vt.edu/courses/101/assignments/1',
-          assignment: { points_possible: 100 },
+          plannable_type: 'assignment',
+          course_id: 101,
+          plannable: {
+            title: 'Homework 1',
+            due_at: '2024-03-15T23:59:00Z',
+            points_possible: 100,
+            html_url: 'https://canvas.vt.edu/courses/101/assignments/1',
+          },
+          submissions: { submitted: false },
         },
         {
-          title: 'Quiz 2',
-          start_at: '2024-03-17T12:00:00Z',
-          context_code: 'course_102',
-          html_url: 'https://canvas.vt.edu/courses/102/assignments/2',
-          assignment: { points_possible: 50 },
+          plannable_type: 'quiz',
+          course_id: 102,
+          plannable: {
+            title: 'Quiz 2',
+            due_at: '2024-03-17T12:00:00Z',
+            points_possible: 50,
+            html_url: 'https://canvas.vt.edu/courses/102/assignments/2',
+          },
+          submissions: { submitted: false },
         },
       ];
-      mockFetch.mockResolvedValue({
-        ok: true,
-        json: () => Promise.resolve(apiResponse),
+      // Route fetch calls by URL: courses endpoint vs planner/items endpoint
+      mockFetch.mockImplementation((url) => {
+        if (url.includes('/courses')) {
+          return Promise.resolve({
+            ok: true,
+            json: () => Promise.resolve([
+              { id: 101, name: 'Math 101' },
+              { id: 102, name: 'CS 102' },
+            ]),
+            headers: { get: () => null },
+          });
+        }
+        // planner/items
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve(plannerResponse),
+          headers: { get: () => null },
+        });
       });
 
       const result = await canvas.getUpcomingAssignments(1, 7);
@@ -88,7 +113,7 @@ describe('canvas integration', () => {
       expect(result[0]).toMatchObject({
         title: 'Homework 1',
         dueDate: '2024-03-15T23:59:00Z',
-        courseName: 'course_101',
+        courseName: 'Math 101',
         pointsPossible: 100,
         htmlUrl: 'https://canvas.vt.edu/courses/101/assignments/1',
       });

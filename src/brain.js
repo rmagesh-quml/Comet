@@ -117,7 +117,8 @@ function getToolsForUser(user) {
         'Use a real headless browser to navigate websites, fill out forms, look things up, ' +
         'check job listings, submit assignments, or do anything requiring actual web browsing. ' +
         'Supports saved login sessions — if the user has logged in before, the session is reused. ' +
-        'Use for: Handshake job search, Canvas web UI, VT Banner, any website task the user asks about. ' +
+        'Use for: Handshake job search, VT Banner, LinkedIn, any website task the user asks about. ' +
+        'Do NOT use for Canvas assignments/grades/data — use get_canvas_data instead (faster, no browser needed). ' +
         'Provide a clear task description and starting URL when known.',
       input_schema: {
         type: 'object',

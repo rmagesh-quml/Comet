@@ -109,8 +109,11 @@ async function getUpcomingAssignments(userId, daysAhead = 7) {
   const startDate = today.toISOString().split('T')[0];
   const endDate = end.toISOString().split('T')[0];
 
+  // Use planner/items — this returns ALL course assignments visible to the student.
+  // The calendar_events?type=assignment endpoint only returns manually-added calendar
+  // events, NOT course assignments, so it always returns 0 for most students.
   const [data, courseMap] = await Promise.all([
-    canvasFetchAll(userId, `/api/v1/calendar_events?type=assignment&start_date=${startDate}&end_date=${endDate}&per_page=50`),
+    canvasFetchAll(userId, `/api/v1/planner/items?per_page=50&start_date=${startDate}&end_date=${endDate}`),
     getCourseNameMap(userId),
   ]);
 
@@ -119,20 +122,29 @@ async function getUpcomingAssignments(userId, daysAhead = 7) {
     return [];
   }
 
+  const ASSIGNMENT_TYPES = new Set(['assignment', 'quiz', 'discussion_topic', 'wiki_page']);
+
   const results = data
-    .filter(e => e.start_at)
+    .filter(e => ASSIGNMENT_TYPES.has(e.plannable_type) && e.plannable)
     .map(e => {
-      const rawCourse = e.context_code || '';
-      const courseName = courseMap.get(rawCourse) || rawCourse;
+      const p = e.plannable;
+      const courseId = String(e.course_id || '');
+      const courseName = courseMap.get(courseId) || courseMap.get(`course_${courseId}`) || courseId || 'Unknown Course';
       return {
-        title: e.title,
-        dueDate: e.start_at,
+        title: p.title || p.name || '(untitled)',
+        dueDate: p.due_at || p.todo_date || null,
         courseName,
-        pointsPossible: e.assignment?.points_possible ?? null,
-        htmlUrl: e.html_url,
+        pointsPossible: p.points_possible ?? null,
+        htmlUrl: p.html_url || null,
+        submitted: e.submissions?.submitted ?? false,
       };
     })
-    .sort((a, b) => new Date(a.dueDate) - new Date(b.dueDate));
+    .filter(a => !a.submitted) // skip already-submitted work
+    .sort((a, b) => {
+      if (!a.dueDate) return 1;
+      if (!b.dueDate) return -1;
+      return new Date(a.dueDate) - new Date(b.dueDate);
+    });
 
   cache.set(cacheKey, results, 15);
   return results;
