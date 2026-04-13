@@ -21,6 +21,7 @@ const { extractInteractionPatterns } = require('./learning/patternExtractor');
 const { refreshStyleCache } = require('./learning/styleAnalyzer');
 const { getEffectiveBriefHour } = require('./briefTime');
 const { renewGmailWatches } = require('./integrations/gmail');
+const { hourInTz, dayOfWeekInTz, todayInTz, fmtDate, fmtTime } = require('./utils/timezone');
 
 // ─── Soul helpers ─────────────────────────────────────────────────────────────
 
@@ -138,7 +139,8 @@ function buildCanvasContext(snapshot, gradeChanges) {
     threeDaysOut.setDate(threeDaysOut.getDate() + 3);
     const soon = snapshot.upcoming.filter(a => new Date(a.dueDate) <= threeDaysOut);
     if (soon.length > 0) {
-      const list = soon.map(a => `${a.title} (${a.courseName}, due ${new Date(a.dueDate).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })})`).join('; ');
+      const briefTz = user?.timezone || 'America/New_York';
+      const list = soon.map(a => `${a.title} (${a.courseName}, due ${a.dueDate ? fmtDate(a.dueDate, briefTz) : 'TBD'})`).join('; ');
       parts.push(`assignments due soon: ${list}`);
     }
   }
@@ -161,14 +163,12 @@ function buildCanvasContext(snapshot, gradeChanges) {
   return parts.length > 0 ? parts.join('\n') : null;
 }
 
-function buildOutlookContext(events, emails) {
+function buildOutlookContext(events, emails, tz = 'America/New_York') {
   const parts = [];
 
   if (events && events.length > 0) {
     const list = events.slice(0, 3).map(e => {
-      const time = e.start
-        ? new Date(e.start).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
-        : '';
+      const time = e.start ? fmtTime(e.start, tz) : '';
       return `${e.title}${time ? ` at ${time}` : ''}${e.isOnlineMeeting ? ' (online)' : ''}`;
     }).join(', ');
     parts.push(`calendar today: ${list}`);
@@ -243,7 +243,7 @@ async function sendMorningBrief(userId) {
     memories: safeVal(results[6], []),
     mood: safeVal(results[7], null),
     schedule: safeVal(results[8], []),
-    dayOfWeek: new Date().toLocaleDateString('en-US', { weekday: 'long' }),
+    dayOfWeek: new Date().toLocaleDateString('en-US', { weekday: 'long', timeZone: user.timezone || 'America/New_York' }),
     briefStats,
   };
 
@@ -300,16 +300,16 @@ function scheduleUserJobs(user) {
     '15 6 * * *',
     async () => {
       try {
-        const today = new Date();
         const effectiveHour = await getEffectiveBriefHour(user.id);
-        const alreadySent = await db.wasEarlyBriefSent(user.id, today.toISOString().split('T')[0]);
+        const todayStr = todayInTz(tz);
+        const alreadySent = await db.wasEarlyBriefSent(user.id, todayStr);
         if (alreadySent) return;
         if (effectiveHour < (user.preferred_brief_hour ?? 9)) {
-          // There's an early class — send brief now if it's past effectiveHour
-          const nowHour = today.getHours();
+          // There's an early class — send brief now if it's past effectiveHour in user's tz
+          const nowHour = hourInTz(tz);
           if (nowHour >= effectiveHour) {
             await sendMorningBrief(user.id);
-            await db.markEarlyBriefSent(user.id, today.toISOString().split('T')[0]);
+            await db.markEarlyBriefSent(user.id, todayStr);
           }
         }
       } catch (err) {
@@ -441,7 +441,7 @@ async function scheduleAllJobs() {
   // Skip between 10pm and 6am when buses aren't running
   let _btFetchRunning = false;
   cron.schedule('*/2 * * * *', async () => {
-    const hour = new Date().getHours();
+    const hour = hourInTz('America/New_York'); // BT serves Blacksburg, VA — always Eastern
     if (hour < 6 || hour >= 22) return; // buses not running
     if (_btFetchRunning) return;
     _btFetchRunning = true;
@@ -472,19 +472,22 @@ async function scheduleAllJobs() {
           const schedule = await getClassSchedule(user.id);
           if (!schedule || schedule.length === 0) continue;
 
-          const now = new Date();
+          const busNow = new Date();
+          const busUserTz = user.timezone || 'America/New_York';
           const DAY_ABBREVS = { 0: 'Su', 1: 'M', 2: 'T', 3: 'W', 4: 'Th', 5: 'F', 6: 'Sa' };
-          const dayAbbrev = DAY_ABBREVS[now.getDay()];
-          const fortyFiveMinsOut = new Date(now.getTime() + 45 * 60 * 1000);
+          const dayAbbrev = DAY_ABBREVS[dayOfWeekInTz(busUserTz)];
+          const fortyFiveMinsOut = new Date(busNow.getTime() + 45 * 60 * 1000);
 
+          // Build classStart by parsing the class's start time as if it were in the user's tz
+          const tzDateStr = todayInTz(busUserTz); // "YYYY-MM-DD"
           const upcomingClasses = schedule
             .filter(cls => cls.days && cls.days.includes(dayAbbrev) && cls.startTime)
             .map(cls => {
-              const [h, m] = cls.startTime.split(':').map(Number);
-              const classStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m);
+              // Parse "HH:MM" in user's timezone → UTC Date
+              const classStart = new Date(`${tzDateStr}T${cls.startTime}:00`);
               return { ...cls, classStart };
             })
-            .filter(cls => cls.classStart > now && cls.classStart <= fortyFiveMinsOut);
+            .filter(cls => cls.classStart > busNow && cls.classStart <= fortyFiveMinsOut);
 
           for (const cls of upcomingClasses) {
             const alertKey = `${user.id}:${cls.name}:${cls.classStart.toDateString()}`;

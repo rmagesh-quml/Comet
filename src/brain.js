@@ -15,6 +15,7 @@ const { getAllEmailContext, getGoogleCalendarEvents } = require('./integrations/
 const { getTodaysForecast } = require('./integrations/weather');
 const { getClassSchedule } = require('./integrations/schedule');
 const { daysUntilExams, isFinalsWeek, getCurrentSemesterWeek, isOnBreak } = require('./utils/academicCalendar');
+const { fmtDate, fmtTime, fmtDateTime } = require('./utils/timezone');
 
 const soulRaw = fs.readFileSync(path.join(__dirname, 'soul.md'), 'utf8');
 
@@ -142,12 +143,6 @@ function getToolsForUser(user) {
 
 // ─── Tool executors ───────────────────────────────────────────────────────────
 
-function fmtDate(dateStr) {
-  const d = new Date(dateStr);
-  return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }) +
-    ' at ' + d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-}
-
 async function executeTool(name, input, userId, user) {
   console.log(`[brain] executing tool: ${name}`, input);
 
@@ -163,7 +158,8 @@ async function executeTool(name, input, userId, user) {
         const upcoming = (snap.upcoming || []).filter(a => new Date(a.dueDate) <= in7d);
         if (upcoming.length > 0) {
           lines.push('Upcoming assignments (next 7 days):');
-          upcoming.forEach(a => lines.push(`• ${a.title} — ${a.courseName} — due ${fmtDate(a.dueDate)}`));
+          const tz = user?.timezone || 'America/New_York';
+          upcoming.forEach(a => lines.push(`• ${a.title} — ${a.courseName} — due ${a.dueDate ? fmtDate(a.dueDate, tz) : 'TBD'}`));
         } else {
           lines.push('No assignments due in the next 7 days.');
         }
@@ -188,21 +184,22 @@ async function executeTool(name, input, userId, user) {
     case 'get_calendar': {
       const parts = [];
 
-      const tomorrow = new Date();
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      const tomorrowStr = tomorrow.toISOString().split('T')[0];
+      const calTz = user?.timezone || 'America/New_York';
+      const { tomorrowInTz: getTomorrowStr } = require('./utils/timezone');
+      const tomorrowStr = getTomorrowStr(calTz);
 
       if (user.microsoft_refresh_token) {
         const events = await getTodaysEvents(userId).catch(() => []) || [];
         const filtered = input.timeframe === 'tomorrow'
-          ? events.filter(e => e.start && e.start.startsWith(tomorrowStr))
+          ? events.filter(e => {
+              if (!e.start) return false;
+              return new Date(e.start).toLocaleDateString('en-CA', { timeZone: calTz }) === tomorrowStr;
+            })
           : events;
         if (filtered.length > 0) {
           parts.push('Outlook:');
           filtered.slice(0, 6).forEach(e => {
-            const time = e.start
-              ? new Date(e.start).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
-              : '';
+            const time = e.start ? fmtTime(e.start, calTz) : '';
             parts.push(`• ${e.title || e.subject}${time ? ` at ${time}` : ''}${e.location ? ` — ${e.location}` : ''}`);
           });
         }
@@ -213,9 +210,7 @@ async function executeTool(name, input, userId, user) {
         if (events.length > 0) {
           parts.push('Google Calendar:');
           events.slice(0, 6).forEach(e => {
-            const time = e.start
-              ? new Date(e.start).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
-              : '';
+            const time = e.start ? fmtTime(e.start, calTz) : '';
             parts.push(`• ${e.title || e.summary}${time ? ` at ${time}` : ''}`);
           });
         }

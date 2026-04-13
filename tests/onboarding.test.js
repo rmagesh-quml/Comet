@@ -48,6 +48,14 @@ describe('onboarding', () => {
     const briefTime = require('../src/briefTime');
     briefTime.parseBriefTime.mockReturnValue(null);
 
+    // Set OAuth env vars so URL builders don't throw
+    process.env.MICROSOFT_CLIENT_ID     = 'test-ms-client-id';
+    process.env.MICROSOFT_CLIENT_SECRET = 'test-ms-secret';
+    process.env.MICROSOFT_REDIRECT_URI  = 'http://localhost:3000/auth/microsoft';
+    process.env.GOOGLE_CLIENT_ID        = 'test-google-client-id';
+    process.env.GOOGLE_CLIENT_SECRET    = 'test-google-secret';
+    process.env.GOOGLE_REDIRECT_URI     = 'http://localhost:3000/auth/google';
+
     db.updateUser.mockResolvedValue(undefined);
     db.scheduleMessage.mockResolvedValue({ id: 1 });
     db.updateBriefPreference.mockResolvedValue(undefined);

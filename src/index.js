@@ -405,7 +405,26 @@ app.get('/auth/google', async (req, res) => {
 
 // ─── Startup ─────────────────────────────────────────────────────────────────
 
+function validateOAuthConfig() {
+  const required = [
+    ['MICROSOFT_CLIENT_ID',     'Azure Portal → App registrations → Application (client) ID'],
+    ['MICROSOFT_CLIENT_SECRET', 'Azure Portal → App registrations → Certificates & secrets'],
+    ['MICROSOFT_REDIRECT_URI',  'e.g. https://your-app.railway.app/auth/microsoft'],
+    ['GOOGLE_CLIENT_ID',        'Google Cloud Console → APIs & Services → Credentials → OAuth 2.0 client ID'],
+    ['GOOGLE_CLIENT_SECRET',    'Google Cloud Console → APIs & Services → Credentials → OAuth 2.0 client secret'],
+    ['GOOGLE_REDIRECT_URI',     'e.g. https://your-app.railway.app/auth/google'],
+  ];
+  const missing = required.filter(([key]) => !process.env[key]);
+  if (missing.length > 0) {
+    console.warn('⚠️  OAuth credentials not configured — Microsoft/Google sign-in will be unavailable:');
+    for (const [key, hint] of missing) {
+      console.warn(`   ${key}  →  ${hint}`);
+    }
+  }
+}
+
 async function startup() {
+  validateOAuthConfig();
   await db.setup();
   console.log('database ready');
 

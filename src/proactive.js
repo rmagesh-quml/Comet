@@ -10,6 +10,7 @@ const { getGoogleCalendarEvents } = require('./integrations/gmail');
 const { getMoodContext } = require('./integrations/spotify');
 const { getTodaysForecast } = require('./integrations/weather');
 const { isOnBreak } = require('./utils/academicCalendar');
+const { hourInTz, dayOfWeekInTz, tomorrowInTz, fmtDate, fmtTime } = require('./utils/timezone');
 
 // ─── Retry helper ─────────────────────────────────────────────────────────────
 // Retries an async fn up to `retries` times with exponential backoff.
@@ -47,8 +48,10 @@ async function shouldSendProactive(userId, triggerType, contextKey = '', opts = 
     return { send: true, contextHash };
   }
 
-  // Hard block: quiet hours (10pm–8am)
-  const hour = new Date().getHours();
+  // Hard block: quiet hours (10pm–8am) in the user's local timezone
+  const userRecord = await db.getUserById(userId);
+  const tz = userRecord?.timezone || 'America/New_York';
+  const hour = hourInTz(tz);
   if (hour < 8 || hour >= 22) {
     return { send: false, reason: 'quiet_hours' };
   }
@@ -141,17 +144,20 @@ async function canvasAlert(userId) {
     return;
   }
 
+  const tz = user.timezone || 'America/New_York';
   const now = new Date();
   const in24h = new Date(now.getTime() + 24 * 60 * 60 * 1000);
   const dueSoon = (snapshot.upcoming || []).filter(a => new Date(a.dueDate) <= in24h);
   const missing = snapshot.missing || [];
-  const isMonday9am = now.getDay() === 1 && now.getHours() === 9;
+  const isMonday9am = dayOfWeekInTz(tz) === 1 && hourInTz(tz) === 9;
   const weeklyAssignments = snapshot.upcoming || [];
 
-  // Detect assignment bunching: 3+ assignments due on the same calendar day
+  // Detect assignment bunching: 3+ assignments due on the same calendar day (in user's tz)
   const dueDateCounts = new Map();
   for (const a of weeklyAssignments) {
-    const day = a.dueDate ? a.dueDate.split('T')[0] : null;
+    const day = a.dueDate
+      ? new Date(a.dueDate).toLocaleDateString('en-CA', { timeZone: tz })
+      : null;
     if (day) dueDateCounts.set(day, (dueDateCounts.get(day) || 0) + 1);
   }
   const hasBunchDay = [...dueDateCounts.values()].some(count => count >= 3);
@@ -172,7 +178,7 @@ async function canvasAlert(userId) {
   }
 
   const context = {
-    dueSoon: dueSoon.map(a => `${a.title} (${a.courseName}, due ${new Date(a.dueDate).toLocaleDateString()})`),
+    dueSoon: dueSoon.map(a => `${a.title} (${a.courseName}, due ${a.dueDate ? fmtDate(a.dueDate, tz) : 'TBD'})`),
     missing: missing.slice(0, 3).map(a => `${a.title} (${a.courseName})`),
     freeBlocks: freeBlocks.map(b => `${b.start}–${b.end}`),
   };
@@ -284,23 +290,30 @@ async function nightlyDigest(userId) {
   let dueTomorrow = [];
   let forecast = null;
 
+  const digestUser = await db.getUserById(userId);
+  const digestTz = digestUser?.timezone || 'America/New_York';
+  const digestTomorrowStr = tomorrowInTz(digestTz);
+
   try {
     tomorrowEvents = await getUpcomingEvents(userId, 2);
-    // Filter to tomorrow's events
-    const tomorrow = new Date();
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    const tomorrowStr = tomorrow.toISOString().split('T')[0];
-    tomorrowEvents = tomorrowEvents.filter(e => e.start && e.start.startsWith(tomorrowStr));
+    // Filter to tomorrow's date in the user's timezone
+    tomorrowEvents = tomorrowEvents.filter(e => {
+      if (!e.start) return false;
+      const evDate = new Date(e.start).toLocaleDateString('en-CA', { timeZone: digestTz });
+      return evDate === digestTomorrowStr;
+    });
   } catch (err) {
     console.warn(`nightlyDigest: could not get upcoming events for user ${userId}:`, err.message || err);
   }
 
   try {
     const snapshot = await withRetry(() => getWeeklySnapshot(userId));
-    const tomorrowEnd = new Date();
-    tomorrowEnd.setDate(tomorrowEnd.getDate() + 2);
-    tomorrowEnd.setHours(23, 59, 59, 0);
-    dueTomorrow = (snapshot.upcoming || []).filter(a => new Date(a.dueDate) <= tomorrowEnd);
+    // "due tomorrow" = anything whose due date falls on tomorrow's date in user's tz
+    dueTomorrow = (snapshot.upcoming || []).filter(a => {
+      if (!a.dueDate) return false;
+      const dueLocalDate = new Date(a.dueDate).toLocaleDateString('en-CA', { timeZone: digestTz });
+      return dueLocalDate === digestTomorrowStr;
+    });
   } catch (err) {
     console.warn(`nightlyDigest: Canvas unavailable for user ${userId}:`, err.message || err);
   }
@@ -362,11 +375,10 @@ async function examCountdown(userId) {
     const gate = await shouldSendProactive(userId, 'exam_countdown', exam.title);
     if (!gate.send) continue;
 
+    const examTz = user.timezone || 'America/New_York';
     const dueDate = new Date(exam.dueDate);
     const hoursOut = Math.round((dueDate - new Date()) / 3600000);
-    const timeStr = hoursOut <= 24
-      ? 'tomorrow'
-      : dueDate.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+    const timeStr = hoursOut <= 24 ? 'tomorrow' : fmtDate(dueDate, examTz);
 
     const message = await generateUserMessage(
       `You are a supportive friend texting a college student. Send a brief, warm good-luck message for an upcoming exam. 1 sentence max. No lecture.
@@ -557,13 +569,11 @@ async function nightlyPlan(userId) {
     ]);
 
     const context = {
-      tomorrow: tomorrow.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' }),
+      tomorrow: fmtDate(tomorrow, user.timezone || 'America/New_York'),
       events: tomorrowEventsResult.status === 'fulfilled'
         ? (tomorrowEventsResult.value || []).slice(0, 5).map(e => ({
             title: e.title,
-            time: e.start
-              ? new Date(e.start).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
-              : null,
+            time: e.start ? fmtTime(e.start, user.timezone || 'America/New_York') : null,
           }))
         : [],
       assignments: snapshotResult.status === 'fulfilled' && snapshotResult.value

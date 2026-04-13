@@ -133,6 +133,14 @@ describe('onboarding integration — full HTTP flow', () => {
     mockStoreClassSchedule.mockResolvedValue([]);
     mockGetNearestStops.mockResolvedValue([{ stopId: 'STOP1', distanceMeters: 100 }]);
     global.fetch = jest.fn().mockResolvedValue({ ok: true });
+
+    // OAuth env vars required by getMicrosoftOAuthUrl / getGoogleOAuthUrl
+    process.env.MICROSOFT_CLIENT_ID     = 'test-ms-client-id';
+    process.env.MICROSOFT_CLIENT_SECRET = 'test-ms-secret';
+    process.env.MICROSOFT_REDIRECT_URI  = 'http://localhost:3000/auth/microsoft';
+    process.env.GOOGLE_CLIENT_ID        = 'test-google-client-id';
+    process.env.GOOGLE_CLIENT_SECRET    = 'test-google-secret';
+    process.env.GOOGLE_REDIRECT_URI     = 'http://localhost:3000/auth/google';
   });
 
   // ─── Step 0 — first contact ────────────────────────────────────────────

@@ -63,20 +63,24 @@ function matchDorm(message) {
 }
 
 function getMicrosoftOAuthUrl(userId) {
+  const clientId = process.env.MICROSOFT_CLIENT_ID;
+  const redirectUri = process.env.MICROSOFT_REDIRECT_URI;
+  if (!clientId) throw new Error('MICROSOFT_CLIENT_ID is not set — cannot generate OAuth URL');
+  if (!redirectUri) throw new Error('MICROSOFT_REDIRECT_URI is not set — cannot generate OAuth URL');
   const tenant = process.env.MICROSOFT_TENANT_ID || 'common';
-  const clientId = process.env.MICROSOFT_CLIENT_ID || '';
-  const redirectUri = encodeURIComponent(process.env.MICROSOFT_REDIRECT_URI || '');
   const scopes = encodeURIComponent('Mail.Read Calendars.Read offline_access User.Read');
-  return `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/authorize?client_id=${clientId}&response_type=code&redirect_uri=${redirectUri}&scope=${scopes}&state=${userId}`;
+  return `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/authorize?client_id=${clientId}&response_type=code&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${scopes}&state=${userId}`;
 }
 
 function getGoogleOAuthUrl(userId) {
-  const clientId = process.env.GOOGLE_CLIENT_ID || '';
-  const redirectUri = encodeURIComponent(process.env.GOOGLE_REDIRECT_URI || '');
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const redirectUri = process.env.GOOGLE_REDIRECT_URI;
+  if (!clientId) throw new Error('GOOGLE_CLIENT_ID is not set — cannot generate OAuth URL');
+  if (!redirectUri) throw new Error('GOOGLE_REDIRECT_URI is not set — cannot generate OAuth URL');
   const scopes = encodeURIComponent(
     'https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/calendar.readonly'
   );
-  return `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&response_type=code&redirect_uri=${redirectUri}&scope=${scopes}&access_type=offline&state=${userId}`;
+  return `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&response_type=code&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${scopes}&access_type=offline&state=${userId}`;
 }
 
 async function validateCanvasToken(canvasBaseUrl, token) {
@@ -175,15 +179,23 @@ async function handleStep5(userId, phone, message) {
   );
 
   if (wantsEmail) {
-    const microsoftUrl = getMicrosoftOAuthUrl(userId);
-    const googleUrl = getGoogleOAuthUrl(userId);
+    let microsoftUrl, googleUrl;
+    try { microsoftUrl = getMicrosoftOAuthUrl(userId); } catch { microsoftUrl = null; }
+    try { googleUrl = getGoogleOAuthUrl(userId); } catch { googleUrl = null; }
+
+    if (!microsoftUrl && !googleUrl) {
+      // Neither provider is configured — skip email step
+      await db.updateUser(userId, { onboarding_step: 7 });
+      await sendMessage(phone, "email integration isn't set up yet — skipping for now. what's your dorm or apartment?", userId);
+      return;
+    }
+
     await db.updateUser(userId, { onboarding_step: 6 });
-    await sendMultiple(phone, [
-      "two links — connect either or both:",
-      `school email (Outlook): ${microsoftUrl}`,
-      `personal email (Gmail): ${googleUrl}`,
-      "reply done when connected or skip",
-    ], userId);
+    const lines = ['two links — connect either or both:'];
+    if (microsoftUrl) lines.push(`school email (Outlook): ${microsoftUrl}`);
+    if (googleUrl) lines.push(`personal email (Gmail): ${googleUrl}`);
+    lines.push('reply done when connected or skip');
+    await sendMultiple(phone, lines, userId);
   } else {
     // Skip email — jump straight to dorm question
     await db.updateUser(userId, { onboarding_step: 7 });
